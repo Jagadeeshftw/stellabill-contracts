@@ -55,18 +55,30 @@ pub fn do_create_subscription(
     amount: i128,
     interval_seconds: u64,
     usage_enabled: bool,
+    expiration: Option<u64>,
 ) -> Result<u32, Error> {
     subscriber.require_auth();
     validate_non_negative(amount)?;
+    if interval_seconds == 0 {
+        return Err(Error::InvalidInput);
+    }
+    let now = env.ledger().timestamp();
     let sub = Subscription {
         subscriber: subscriber.clone(),
         merchant: merchant.clone(),
         amount,
         interval_seconds,
-        last_payment_timestamp: env.ledger().timestamp(),
+        last_payment_timestamp: now,
         status: SubscriptionStatus::Active,
         prepaid_balance: 0i128,
         usage_enabled,
+        expiration,
+        billing_anchor_timestamp: now,
+        current_period_index: 0,
+        current_period_usage_units: 0,
+        usage_cap_units: None,
+        usage_rate_limit_max_calls: None,
+        usage_rate_window_secs: 0,
     };
     let id = next_id(env);
     env.storage().instance().set(&id, &sub);
@@ -280,18 +292,70 @@ pub fn do_create_subscription_from_plan(
 
     let plan = get_plan_template(env, plan_template_id)?;
 
+    let now = env.ledger().timestamp();
     let sub = Subscription {
         subscriber: subscriber.clone(),
         merchant: plan.merchant,
         amount: plan.amount,
         interval_seconds: plan.interval_seconds,
-        last_payment_timestamp: env.ledger().timestamp(),
+        last_payment_timestamp: now,
         status: SubscriptionStatus::Active,
         prepaid_balance: 0i128,
         usage_enabled: plan.usage_enabled,
+        expiration: None,
+        billing_anchor_timestamp: now,
+        current_period_index: 0,
+        current_period_usage_units: 0,
+        usage_cap_units: None,
+        usage_rate_limit_max_calls: None,
+        usage_rate_window_secs: 0,
     };
 
     let id = next_id(env);
     env.storage().instance().set(&id, &sub);
     Ok(id)
+}
+
+pub fn do_set_usage_cap(
+    env: &Env,
+    subscription_id: u32,
+    authorizer: Address,
+    usage_cap_units: Option<i128>,
+) -> Result<(), Error> {
+    authorizer.require_auth();
+    let mut sub = get_subscription(env, subscription_id)?;
+    if authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+    if let Some(cap) = usage_cap_units {
+        if cap <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+    }
+    sub.usage_cap_units = usage_cap_units;
+    env.storage().instance().set(&subscription_id, &sub);
+    Ok(())
+}
+
+pub fn do_set_usage_rate_limit(
+    env: &Env,
+    subscription_id: u32,
+    authorizer: Address,
+    max_calls: Option<u32>,
+    window_seconds: u64,
+) -> Result<(), Error> {
+    authorizer.require_auth();
+    let mut sub = get_subscription(env, subscription_id)?;
+    if authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+    if let Some(max) = max_calls {
+        if max == 0 || window_seconds == 0 {
+            return Err(Error::InvalidInput);
+        }
+    }
+    sub.usage_rate_limit_max_calls = max_calls;
+    sub.usage_rate_window_secs = window_seconds;
+    env.storage().instance().set(&subscription_id, &sub);
+    Ok(())
 }

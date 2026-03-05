@@ -64,7 +64,7 @@ impl ReentrancyGuard {
     /// This function is unsafe because it stores a raw pointer to the environment.
     /// The pointer must remain valid for the lifetime of the guard.
     pub fn lock(env: &Env, function_name: &str) -> Result<Self, Error> {
-        let lock_key = Symbol::new(env, &format!("reenan:{}", function_name));
+        let lock_key = Symbol::new(env, function_name);
 
         let storage = env.storage().instance();
 
