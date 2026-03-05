@@ -1,4 +1,4 @@
-//! Contract types: errors and subscription data structures.
+//! Contract types: errors, subscription data structures, and event types.
 //!
 //! Kept in a separate module to reduce merge conflicts when editing state machine
 //! or contract entrypoints.
@@ -32,9 +32,6 @@ pub enum DataKey {
 }
 
 /// Detailed error information for insufficient balance scenarios.
-///
-/// This struct provides machine-parseable information about why a charge failed
-/// due to insufficient balance, enabling better error handling in clients.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InsufficientBalanceError {
@@ -45,7 +42,6 @@ pub struct InsufficientBalanceError {
 }
 
 impl InsufficientBalanceError {
-    /// Creates a new InsufficientBalanceError with the given available and required amounts.
     pub const fn new(available: i128, required: i128) -> Self {
         Self {
             available,
@@ -53,7 +49,6 @@ impl InsufficientBalanceError {
         }
     }
 
-    /// Returns the shortfall amount (required - available).
     pub fn shortfall(&self) -> i128 {
         self.required - self.available
     }
@@ -64,22 +59,19 @@ impl InsufficientBalanceError {
 #[repr(u32)]
 pub enum Error {
     // --- Auth Errors (401-403) ---
-    /// Caller does not have the required authorization or is not the admin.
-    /// Typically occurs when a required signature is missing.
+    /// Caller does not have the required authorization.
     Unauthorized = 401,
     /// Caller is authorized but does not have permission for this specific action.
-    /// Occurs when a non-admin attempts to perform an admin-only operation.
     Forbidden = 403,
 
     // --- Not Found (404) ---
-    /// The requested resource (e.g. subscription) was not found in storage.
+    /// The requested resource was not found in storage.
     NotFound = 404,
 
-    // --- Invalid Input (400, 405-409) ---
+    // --- Invalid Input (400, 402, 405-409) ---
     /// The requested state transition is not allowed by the state machine.
-    /// E.g., attempting to resume a 'Cancelled' subscription.
     InvalidStatusTransition = 400,
-    /// The top-up amount is below the minimum required threshold configured by the admin.
+    /// The top-up amount is below the minimum required threshold.
     BelowMinimumTopup = 402,
 
     // --- Business Logic Errors (1001-1005, 1010, 1012-1016) ---
@@ -115,6 +107,12 @@ pub enum Error {
     InvalidInput = 1015,
     /// Reentrancy detected - function called recursively during execution.
     Reentrancy = 1016,
+    /// Lifetime charge cap has been reached; no further charges are allowed.
+    LifetimeCapReached = 1017,
+    /// Contract is already initialized; init may only be called once.
+    AlreadyInitialized = 1018,
+    /// The contract has allocated the maximum number of subscriptions.
+    SubscriptionLimitReached = 429,
 }
 
 impl Error {
@@ -142,93 +140,59 @@ impl Error {
             Error::NotInitialized => 1013,
             Error::InvalidExportLimit => 1014,
             Error::Reentrancy => 1016,
+            Error::LifetimeCapReached => 1017,
+            Error::AlreadyInitialized => 1018,
+            Error::SubscriptionLimitReached => 429,
         }
     }
 }
 
-/// Result of charging one subscription in a batch. Used by [`crate::SubscriptionVault::batch_charge`].
+/// Result of charging one subscription in a batch.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BatchChargeResult {
     /// True if the charge succeeded.
     pub success: bool,
-    /// If success is false, the error code (e.g. from [`Error::to_code`]); otherwise 0.
+    /// If success is false, the error code; otherwise 0.
+    pub error_code: u32,
+}
+
+/// Result of a batch merchant withdrawal operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchWithdrawResult {
+    pub success: bool,
     pub error_code: u32,
 }
 
 /// Represents the lifecycle state of a subscription.
 ///
-/// See `docs/subscription_lifecycle.md` for how each status is entered and exited and for invariants.
+/// See `docs/subscription_lifecycle.md` for how each status is entered and exited.
 ///
 /// # State Machine
 ///
-/// The subscription status follows a defined state machine with specific allowed transitions:
-///
 /// - **Active**: Subscription is active and charges can be processed.
 ///   - Can transition to: `Paused`, `Cancelled`, `InsufficientBalance`, `GracePeriod`
-///
-/// - **Paused**: Subscription is temporarily suspended, no charges are processed.
+/// - **Paused**: Subscription is temporarily suspended, no charges processed.
 ///   - Can transition to: `Active`, `Cancelled`
-///
-/// - **Cancelled**: Subscription is permanently terminated, no further changes allowed.
-///   - No outgoing transitions (terminal state)
-///
+/// - **Cancelled**: Subscription is permanently terminated (terminal state).
+///   - No outgoing transitions
 /// - **InsufficientBalance**: Subscription failed due to insufficient funds.
-///   - This status is automatically set when a charge attempt fails due to insufficient
-///     prepaid balance.
 ///   - Can transition to: `Active` (after deposit + resume), `Cancelled`
-///   - The subscription cannot be charged while in this status.
-///
-/// # When InsufficientBalance Occurs
-///
-/// A subscription transitions to `InsufficientBalance` when:
-/// 1. A [`crate::SubscriptionVault::charge_subscription`] call finds `prepaid_balance < amount`
-/// 2. A [`crate::SubscriptionVault::charge_usage`] call drains the balance to zero
-///
-/// # Recovery from InsufficientBalance
-///
-/// To recover from `InsufficientBalance`:
-/// 1. Subscriber calls [`crate::SubscriptionVault::deposit_funds`] to add funds
-/// 2. Subscriber calls [`crate::SubscriptionVault::resume_subscription`] to transition back to `Active`
-/// 3. Subsequent charges will succeed if sufficient balance exists
-///
 /// - **GracePeriod**: Subscription is in grace period after a missed charge.
-///   - Can transition to: `Active` (after deposit), `InsufficientBalance`, `Cancelled`
-///
-/// Invalid transitions (e.g., `Cancelled` -> `Active`) are rejected with
-/// [`Error::InvalidStatusTransition`].
+///   - Can transition to: `Active`, `InsufficientBalance`, `Cancelled`
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionStatus {
     /// Subscription is active and ready for charging.
-    ///
-    /// Only in this state can [`crate::SubscriptionVault::charge_subscription`] and
-    /// [`crate::SubscriptionVault::charge_usage`] successfully process charges.
     Active = 0,
     /// Subscription is temporarily paused, no charges processed.
-    ///
-    /// Pausing preserves the subscription agreement but prevents charges.
-    /// Use [`crate::SubscriptionVault::resume_subscription`] to return to Active.
     Paused = 1,
     /// Subscription is permanently cancelled (terminal state).
-    ///
-    /// Once cancelled, the subscription cannot be resumed or modified.
-    /// Remaining funds can be withdrawn by the subscriber.
     Cancelled = 2,
     /// Subscription failed due to insufficient balance for charging.
-    ///
-    /// This status indicates that the last charge attempt failed because the
-    /// prepaid balance was insufficient. The subscription cannot be charged
-    /// until the subscriber adds more funds.
-    ///
-    /// # Client Handling
-    ///
-    /// UI should:
-    /// - Display a "payment required" message to the subscriber
-    /// - Provide a way to initiate a deposit
-    /// - Optionally auto-retry after deposit (if using resume)
     InsufficientBalance = 3,
-    /// Subscription failed resulting in entry into grace period before suspension.
+    /// Subscription is in grace period after a missed charge.
     GracePeriod = 4,
 }
 
@@ -238,30 +202,37 @@ pub enum SubscriptionStatus {
 /// transition helpers to modify status, never set it directly.
 /// See `docs/subscription_lifecycle.md` for lifecycle and on-chain representation.
 ///
-/// Serialization: This named-field struct is encoded on-ledger as a ScMap keyed
-/// by the field names. Renaming fields, reordering is inconsequential to map
-/// semantics but still alters the encoded bytes and will break golden vectors.
-/// Changing any field type or the representation of [`SubscriptionStatus`] is
-/// a storage-breaking change. To extend, prefer adding new optional fields at
-/// the end with conservative defaults; doing so still changes bytes and must
-/// be treated as a versioned change.
+/// # Storage Schema
+///
+/// This is a named-field struct encoded on-ledger as a ScMap keyed by field names.
+/// Adding new fields at the end with conservative defaults is a storage-extending change.
+/// Changing field types or removing fields is a breaking change.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Subscription {
-    /// Identity of the subscriber. Renaming or changing this field breaks the
-    /// encoded form and must be treated as a breaking change.
     pub subscriber: Address,
-    /// Identity of the merchant. Renaming or changing this field breaks the
-    /// encoded form and must be treated as a breaking change.
     pub merchant: Address,
+    /// Recurring charge amount per billing interval (in token base units, e.g. stroops for USDC).
     pub amount: i128,
+    /// Billing interval in seconds.
     pub interval_seconds: u64,
     pub last_payment_timestamp: u64,
     /// Current lifecycle state. Modified only through state machine transitions.
-    /// Changing the enum or this field name affects the encoded form.
     pub status: SubscriptionStatus,
+    /// Subscriber's prepaid balance held in escrow by the contract.
     pub prepaid_balance: i128,
     pub usage_enabled: bool,
+    /// Optional maximum total amount (in token base units) that may ever be charged
+    /// over the entire lifespan of this subscription. `None` means no cap.
+    ///
+    /// Units: same as `amount` (token base units, e.g. 1 USDC = 1_000_000 for 6 decimals).
+    pub lifetime_cap: Option<i128>,
+    /// Cumulative total of all amounts successfully charged so far.
+    ///
+    /// Incremented on every successful interval charge and usage charge.
+    /// When `lifetime_cap` is `Some(cap)` and `lifetime_charged >= cap`, no
+    /// further charges are processed and the subscription transitions to `Cancelled`.
+    pub lifetime_charged: i128,
 }
 
 /// A read-only snapshot of the contract's configuration and current state.
@@ -289,6 +260,8 @@ pub struct SubscriptionSummary {
     pub status: SubscriptionStatus,
     pub prepaid_balance: i128,
     pub usage_enabled: bool,
+    pub lifetime_cap: Option<i128>,
+    pub lifetime_charged: i128,
 }
 
 /// Event emitted when subscriptions are exported for migration.
@@ -305,72 +278,58 @@ pub struct MigrationExportEvent {
 /// Defines a reusable subscription plan template.
 ///
 /// Plan templates allow merchants to define standard subscription offerings
-/// (e.g., "Basic Plan", "Premium Plan") with predefined parameters. Subscribers
-/// can then create subscriptions from these templates without manually specifying
-/// all parameters, ensuring consistency and reducing errors.
-///
-/// # Usage
-///
-/// - Use templates for standardized subscription offerings
-/// - Use direct subscription creation for custom one-off subscriptions
+/// with predefined parameters. Subscribers can create subscriptions from these
+/// templates without manually specifying all parameters.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PlanTemplate {
     /// Merchant who owns this plan template.
     pub merchant: Address,
-    /// Recurring charge amount per interval.
+    /// Recurring charge amount per interval (token base units).
     pub amount: i128,
     /// Billing interval in seconds.
     pub interval_seconds: u64,
     /// Whether usage-based charging is enabled.
     pub usage_enabled: bool,
+    /// Optional lifetime cap applied to subscriptions created from this template.
+    ///
+    /// When `Some(cap)`, subscriptions created via this template will inherit the cap.
+    /// `None` means subscriptions created from this template have no lifetime cap.
+    pub lifetime_cap: Option<i128>,
 }
 
 /// Result of computing next charge information for a subscription.
-///
-/// Contains the estimated next charge timestamp and a flag indicating
-/// whether the charge is expected to occur based on the subscription status.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NextChargeInfo {
     /// Estimated timestamp for the next charge attempt.
-    /// For Active and InsufficientBalance states, this is `last_payment_timestamp + interval_seconds`.
-    /// For Paused and Cancelled states, this represents when the charge *would* occur if the
-    /// subscription were Active, but `is_charge_expected` will be `false`.
     pub next_charge_timestamp: u64,
-
     /// Whether a charge is actually expected based on the subscription status.
-    /// - `true` for Active subscriptions (charge will be attempted)
-    /// - `true` for InsufficientBalance (charge will be retried after funding)
-    /// - `false` for Paused subscriptions (no charges until resumed)
-    /// - `false` for Cancelled subscriptions (terminal state, no future charges)
     pub is_charge_expected: bool,
 }
 
-/// Computes the estimated next charge timestamp for a subscription.
+/// View of a subscription's lifetime cap status.
 ///
-/// This is a readonly helper that does not mutate contract state. It provides
-/// information for off-chain scheduling systems and UX displays.
-pub fn compute_next_charge_info(subscription: &Subscription) -> NextChargeInfo {
-    let next_charge_timestamp = subscription
-        .last_payment_timestamp
-        .saturating_add(subscription.interval_seconds);
-
-    let is_charge_expected = match subscription.status {
-        SubscriptionStatus::Active => true,
-        SubscriptionStatus::InsufficientBalance => true, // Will be retried after funding
-        SubscriptionStatus::GracePeriod => true,         // Will be retried after grace period
-        SubscriptionStatus::Paused => false,
-        SubscriptionStatus::Cancelled => false,
-    };
+/// Returned by `get_cap_info` for off-chain dashboards and UX displays.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapInfo {
+    /// The configured lifetime cap, or `None` if no cap is set.
+    pub lifetime_cap: Option<i128>,
+    /// Total amount charged over the subscription's lifetime so far.
+    pub lifetime_charged: i128,
+    /// Remaining chargeable amount before cap is hit (`cap - charged`).
+    /// `None` when no cap is configured.
+    pub remaining_cap: Option<i128>,
+    /// True when the cap has been reached and no further charges are allowed.
+    pub cap_reached: bool,
+}
 
 /// Event emitted when emergency stop is enabled.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EmergencyStopEnabledEvent {
-    /// The admin who enabled the emergency stop.
     pub admin: Address,
-    /// Timestamp when emergency stop was enabled.
     pub timestamp: u64,
 }
 
@@ -378,72 +337,34 @@ pub struct EmergencyStopEnabledEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EmergencyStopDisabledEvent {
-    /// The admin who disabled the emergency stop.
     pub admin: Address,
-    /// Timestamp when emergency stop was disabled.
     pub timestamp: u64,
 }
 
-/// Emitted when a merchant-initiated one-off charge is applied to a subscription.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OneOffChargedEvent {
-    pub subscription_id: u32,
-    pub merchant: Address,
-    pub amount: i128,
-    NextChargeInfo {
-        next_charge_timestamp,
-        is_charge_expected,
-    }
-}
-
 /// Represents the reason for stranded funds that can be recovered by admin.
-///
-/// This enum documents the specific, well-defined cases where funds may become
-/// stranded in the contract and require administrative intervention. Each case
-/// must be carefully audited before recovery is permitted.
-///
-/// # Security Note
-///
-/// Recovery is an exceptional operation that should only be used for truly
-/// stranded funds. All recovery operations are logged via events and should
-/// be subject to governance review.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryReason {
-    /// Funds sent to contract address by mistake (no associated subscription).
-    /// This occurs when users accidentally send tokens directly to the contract.
+    /// Funds sent to contract address by mistake.
     AccidentalTransfer = 0,
-
     /// Funds from deprecated contract flows or logic errors.
-    /// Used when contract upgrades or bugs leave funds in an inaccessible state.
     DeprecatedFlow = 1,
-
     /// Funds from cancelled subscriptions with unreachable addresses.
-    /// Subscribers may lose access to their withdrawal keys after cancellation.
     UnreachableSubscriber = 2,
 }
 
 /// Event emitted when admin recovers stranded funds.
-///
-/// This event provides a complete audit trail for all recovery operations,
-/// including who initiated it, why, and how much was recovered.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct RecoveryEvent {
-    /// The admin who authorized the recovery
     pub admin: Address,
-    /// The destination address receiving the recovered funds
     pub recipient: Address,
-    /// The amount of funds recovered
     pub amount: i128,
-    /// The documented reason for recovery
     pub reason: RecoveryReason,
-    /// Timestamp when recovery was executed
     pub timestamp: u64,
 }
 
-// Event types
+/// Event emitted when a subscription is created.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SubscriptionCreatedEvent {
@@ -452,8 +373,10 @@ pub struct SubscriptionCreatedEvent {
     pub merchant: Address,
     pub amount: i128,
     pub interval_seconds: u64,
+    pub lifetime_cap: Option<i128>,
 }
 
+/// Event emitted when funds are deposited into a subscription vault.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct FundsDepositedEvent {
@@ -462,14 +385,17 @@ pub struct FundsDepositedEvent {
     pub amount: i128,
 }
 
+/// Event emitted when a subscription interval charge succeeds.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SubscriptionChargedEvent {
     pub subscription_id: u32,
     pub merchant: Address,
     pub amount: i128,
+    pub lifetime_charged: i128,
 }
 
+/// Event emitted when a subscription is cancelled.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SubscriptionCancelledEvent {
@@ -478,6 +404,7 @@ pub struct SubscriptionCancelledEvent {
     pub refund_amount: i128,
 }
 
+/// Event emitted when a subscription is paused.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SubscriptionPausedEvent {
@@ -485,6 +412,7 @@ pub struct SubscriptionPausedEvent {
     pub authorizer: Address,
 }
 
+/// Event emitted when a subscription is resumed.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SubscriptionResumedEvent {
@@ -492,6 +420,7 @@ pub struct SubscriptionResumedEvent {
     pub authorizer: Address,
 }
 
+/// Event emitted when a merchant withdraws funds.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct MerchantWithdrawalEvent {
@@ -499,11 +428,27 @@ pub struct MerchantWithdrawalEvent {
     pub amount: i128,
 }
 
-/// Emitted when a merchant-initiated one-off charge is applied to a subscription.
+/// Event emitted when a merchant-initiated one-off charge is applied.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct OneOffChargedEvent {
     pub subscription_id: u32,
     pub merchant: Address,
     pub amount: i128,
+}
+
+/// Event emitted when the lifetime charge cap is reached.
+///
+/// Signals that the subscription has been cancelled because it has been charged
+/// up to its configured maximum total amount.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct LifetimeCapReachedEvent {
+    pub subscription_id: u32,
+    /// The configured lifetime cap that was reached.
+    pub lifetime_cap: i128,
+    /// Total charged at the point the cap was reached.
+    pub lifetime_charged: i128,
+    /// Timestamp when the cap was reached.
+    pub timestamp: u64,
 }
