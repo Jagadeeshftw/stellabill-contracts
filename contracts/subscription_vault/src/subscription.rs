@@ -15,10 +15,6 @@
 //! 2. **Effects**: Update internal contract state (prepaid_balance) in storage
 //! 3. **Interactions**: Call token.transfer() AFTER state is persisted
 //!
-//! This ordering ensures that even if the token contract calls back into our contract,
-//! the contract state will already be consistent and the attacker cannot exploit the
-//! temporal inconsistency.
-//!
 //! See `docs/reentrancy.md` for full details on reentrancy threats and mitigations.
 
 use crate::queries::get_subscription;
@@ -54,18 +50,14 @@ pub fn do_create_subscription(
     amount: i128,
     interval_seconds: u64,
     usage_enabled: bool,
-    expiration: Option<u64>,
-) -> Result<u32, Error> {
-    subscriber.require_auth();
-    validate_non_negative(amount)?;
-    if interval_seconds == 0 {
-        return Err(Error::InvalidInput);
-    }
-    let now = env.ledger().timestamp();
     lifetime_cap: Option<i128>,
 ) -> Result<u32, Error> {
     subscriber.require_auth();
     validate_non_negative(amount)?;
+
+    if interval_seconds == 0 {
+        return Err(Error::InvalidInput);
+    }
 
     // Validate lifetime_cap if provided
     if let Some(cap) = lifetime_cap {
@@ -73,6 +65,8 @@ pub fn do_create_subscription(
             return Err(Error::InvalidAmount);
         }
     }
+
+    let now = env.ledger().timestamp();
 
     let sub = Subscription {
         subscriber: subscriber.clone(),
@@ -83,7 +77,7 @@ pub fn do_create_subscription(
         status: SubscriptionStatus::Active,
         prepaid_balance: 0i128,
         usage_enabled,
-        expiration,
+        expiration: None,
         billing_anchor_timestamp: now,
         current_period_index: 0,
         current_period_usage_units: 0,
@@ -104,7 +98,7 @@ pub fn do_create_subscription(
 
     env.storage().instance().set(&id, &sub);
 
-    // Maintain merchant → subscription-ID index
+    // Maintain merchant -> subscription-ID index
     let merchant_key = DataKey::MerchantSubs(sub.merchant.clone());
     let mut ids: Vec<u32> = env
         .storage()
@@ -136,9 +130,7 @@ pub fn do_deposit_funds(
 ) -> Result<(), Error> {
     subscriber.require_auth();
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // CHECKS: Validate all preconditions before any state mutations
-    // ──────────────────────────────────────────────────────────────────────────
+    // CHECKS
     let min_topup: i128 = crate::admin::get_min_topup(env)?;
     if amount < min_topup {
         return Err(Error::BelowMinimumTopup);
@@ -152,19 +144,14 @@ pub fn do_deposit_funds(
         .get(&Symbol::new(env, "token"))
         .ok_or(Error::NotInitialized)?;
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // EFFECTS: Update internal state before external interactions (CEI pattern)
-    // ──────────────────────────────────────────────────────────────────────────
+    // EFFECTS
     sub.prepaid_balance = safe_add_balance(sub.prepaid_balance, amount)?;
     env.storage().instance().set(&subscription_id, &sub);
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // INTERACTIONS: Only after internal state is consistent, call token contract
-    // ──────────────────────────────────────────────────────────────────────────
+    // INTERACTIONS
     let token_client = soroban_sdk::token::Client::new(env, &token_addr);
     token_client.transfer(&subscriber, &env.current_contract_address(), &amount);
 
-    // Emit event after successful transfer
     env.events().publish(
         (Symbol::new(env, "deposited"), subscription_id),
         (subscriber, amount, sub.prepaid_balance),
@@ -223,9 +210,6 @@ pub fn do_resume_subscription(
 }
 
 /// Merchant-initiated one-off charge: debits `amount` from the subscription's prepaid balance.
-///
-/// Requires merchant auth; the subscription's merchant must match the caller.
-/// Subscription must be Active or Paused. Amount must be positive and not exceed prepaid_balance.
 ///
 /// One-off charges also count toward the lifetime cap when one is configured.
 pub fn do_charge_one_off(
@@ -378,7 +362,7 @@ pub fn do_create_subscription_from_plan(
 
     env.storage().instance().set(&id, &sub);
 
-    // Maintain merchant → subscription-ID index
+    // Maintain merchant -> subscription-ID index
     let merchant_key = DataKey::MerchantSubs(plan.merchant.clone());
     let mut ids: Vec<u32> = env
         .storage()
