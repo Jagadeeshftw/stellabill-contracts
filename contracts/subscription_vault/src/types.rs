@@ -1,4 +1,3 @@
-//! Contract types: errors, state, and events.
 //! Contract types: errors, subscription data structures, and event types.
 //!
 //! Kept in a separate module to reduce merge conflicts when editing state machine
@@ -6,58 +5,42 @@
 
 use soroban_sdk::{contracterror, contracttype, Address};
 
-pub const BILLING_SNAPSHOT_FLAG_CLOSED: u32 = 1 << 0;
-pub const BILLING_SNAPSHOT_FLAG_INTERVAL_CHARGED: u32 = 1 << 1;
-pub const BILLING_SNAPSHOT_FLAG_USAGE_CHARGED: u32 = 1 << 2;
-pub const BILLING_SNAPSHOT_FLAG_EMPTY_PERIOD: u32 = 1 << 3;
-
+/// Storage keys for secondary indices.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Maps a merchant address to its list of subscription IDs.
     MerchantSubs(Address),
+    /// USDC token contract address. Discriminant 1.
+    Token,
+    /// Authorized admin address. Discriminant 2.
+    Admin,
+    /// Minimum deposit threshold. Discriminant 3.
+    MinTopup,
+    /// Auto-incrementing subscription ID counter. Discriminant 4.
+    NextId,
+    /// On-chain storage schema version. Discriminant 5.
+    SchemaVersion,
+    /// Subscription record keyed by its ID. Discriminant 6.
+    Sub(u32),
+    /// Last charged billing-period index for replay protection. Discriminant 7.
+    ChargedPeriod(u32),
+    /// Idempotency key stored per subscription. Discriminant 8.
+    IdemKey(u32),
+    /// Emergency stop flag - when true, critical operations are blocked. Discriminant 9.
+    EmergencyStop,
 }
 
 /// Detailed error information for insufficient balance scenarios.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SubscriptionStatus {
-    Active = 0,
-    Paused = 1,
-    Cancelled = 2,
-    InsufficientBalance = 3,
-    GracePeriod = 4,
+pub struct InsufficientBalanceError {
+    /// The current available prepaid balance in the subscription vault.
+    pub available: i128,
+    /// The required amount to complete the charge.
+    pub required: i128,
 }
 
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Subscription {
-    pub subscriber: Address,
-    pub merchant: Address,
-    pub amount: i128,
-    pub interval_seconds: u64,
-    pub last_payment_timestamp: u64,
-    pub status: SubscriptionStatus,
-    pub prepaid_balance: i128,
-    pub usage_enabled: bool,
-    pub expiration: Option<u64>,
-    pub billing_anchor_timestamp: u64,
-    pub current_period_index: u32,
-    pub current_period_usage_units: i128,
-    pub usage_cap_units: Option<i128>,
-    pub usage_rate_limit_max_calls: Option<u32>,
-    pub usage_rate_window_secs: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BillingPeriodSnapshot {
-    pub subscription_id: u32,
-    pub period_index: u32,
-    pub period_start_timestamp: u64,
-    pub period_end_timestamp: u64,
-    pub total_amount_charged: i128,
-    pub total_usage_units: i128,
-    pub status_flags: u32,
 impl InsufficientBalanceError {
     pub const fn new(available: i128, required: i128) -> Self {
         Self {
@@ -75,10 +58,6 @@ impl InsufficientBalanceError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    Unauthorized = 401,
-    Forbidden = 403,
-    NotFound = 404,
-    InvalidStatusTransition = 400,
     // --- Auth Errors (401-403) ---
     /// Caller does not have the required authorization.
     Unauthorized = 401,
@@ -94,29 +73,40 @@ pub enum Error {
     InvalidStatusTransition = 400,
     /// The top-up amount is below the minimum required threshold.
     BelowMinimumTopup = 402,
-    InvalidRecoveryAmount = 405,
-    SubscriptionExpired = 410,
-    SubscriptionLimitReached = 429,
+
+    // --- Business Logic Errors (1001-1005, 1010, 1012-1016) ---
+    /// Charge interval has not elapsed since the last payment.
     IntervalNotElapsed = 1001,
+    /// Subscription is not in an active state for this operation.
     NotActive = 1002,
+    /// Insufficient balance in the subscription vault.
     InsufficientBalance = 1003,
+    /// Usage charging is not enabled for this subscription.
     UsageNotEnabled = 1004,
+    /// Insufficient prepaid balance for the requested usage charge.
     InsufficientPrepaidBalance = 1005,
+    /// The provided amount is zero or negative.
     InvalidAmount = 1006,
+    /// Charge already processed for this billing period (replay protection).
     Replay = 1007,
+    /// Invalid recovery amount provided.
+    InvalidRecoveryAmount = 1008,
+    /// Emergency stop is active - critical operations are blocked.
     EmergencyStopActive = 1009,
+    /// Operation would result in a negative balance or underflow.
     Underflow = 1010,
+    /// Recovery operation not allowed for this reason or context.
     RecoveryNotAllowed = 1011,
+    /// Combined balance would overflow i128.
     Overflow = 1012,
+    /// The contract or requested configuration is not initialized.
     NotInitialized = 1013,
+    /// The requested export limit exceeds the maximum allowed.
     InvalidExportLimit = 1014,
+    /// Invalid input provided to a function.
     InvalidInput = 1015,
+    /// Reentrancy detected - function called recursively during execution.
     Reentrancy = 1016,
-    AlreadyInitialized = 1017,
-    UsageCapExceeded = 1018,
-    RateLimitExceeded = 1019,
-    InvalidFeeBps = 1020,
-    TreasuryNotConfigured = 1021,
     /// Lifetime charge cap has been reached; no further charges are allowed.
     LifetimeCapReached = 1017,
     /// Contract is already initialized; init may only be called once.
@@ -126,11 +116,8 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns the numeric code for this error (for batch result reporting).
     pub const fn to_code(self) -> u32 {
-        self as u32
-    }
-}
-
         match self {
             Error::NotFound => 404,
             Error::Unauthorized => 401,
@@ -164,10 +151,8 @@ impl Error {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BatchChargeResult {
+    /// True if the charge succeeded.
     pub success: bool,
-    pub error_code: u32,
-}
-
     /// If success is false, the error code; otherwise 0.
     pub error_code: u32,
 }
@@ -298,31 +283,19 @@ pub struct MigrationExportEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PlanTemplate {
+    /// Merchant who owns this plan template.
     pub merchant: Address,
     /// Recurring charge amount per interval (token base units).
     pub amount: i128,
+    /// Billing interval in seconds.
     pub interval_seconds: u64,
+    /// Whether usage-based charging is enabled.
     pub usage_enabled: bool,
     /// Optional lifetime cap applied to subscriptions created from this template.
     ///
     /// When `Some(cap)`, subscriptions created via this template will inherit the cap.
     /// `None` means subscriptions created from this template have no lifetime cap.
     pub lifetime_cap: Option<i128>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NextChargeInfo {
-    pub next_charge_timestamp: u64,
-    pub is_charge_expected: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RecoveryReason {
-    AccidentalTransfer = 0,
-    DeprecatedFlow = 1,
-    UnreachableSubscriber = 2,
 }
 
 /// Result of computing next charge information for a subscription.
@@ -394,11 +367,8 @@ pub struct RecoveryEvent {
 /// Event emitted when a subscription is created.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct UsageCapReachedEvent {
+pub struct SubscriptionCreatedEvent {
     pub subscription_id: u32,
-    pub period_index: u32,
-    pub cap_units: i128,
-    pub attempted_units: i128,
     pub subscriber: Address,
     pub merchant: Address,
     pub amount: i128,
@@ -409,13 +379,6 @@ pub struct UsageCapReachedEvent {
 /// Event emitted when funds are deposited into a subscription vault.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct ProtocolFeeSkimmedEvent {
-    pub subscription_id: u32,
-    pub merchant: Address,
-    pub treasury: Address,
-    pub gross_amount: i128,
-    pub fee_amount: i128,
-    pub net_amount: i128,
 pub struct FundsDepositedEvent {
     pub subscription_id: u32,
     pub subscriber: Address,
@@ -444,7 +407,6 @@ pub struct SubscriptionCancelledEvent {
 /// Event emitted when a subscription is paused.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct SubscriptionChargedEvent {
 pub struct SubscriptionPausedEvent {
     pub subscription_id: u32,
     pub authorizer: Address,
