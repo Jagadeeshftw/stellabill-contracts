@@ -21,6 +21,7 @@ pub const MAX_METADATA_VALUE_LENGTH: u32 = 256;
 #[derive(Clone)]
 pub enum DataKey {
     MerchantSubs(Address),
+    EmergencyStop,
 }
 
 /// Represents the lifecycle state of a subscription.
@@ -161,6 +162,8 @@ pub enum Error {
     MetadataKeyTooLong = 1024,
     /// Metadata value exceeds maximum allowed length.
     MetadataValueTooLong = 1025,
+    /// Subscriber is on the blocklist and cannot create or interact with subscriptions.
+    SubscriberBlocklisted = 1026,
 }
 
 impl Error {
@@ -317,6 +320,17 @@ pub struct ProtocolFeeSkimmedEvent {
     pub gross_amount: i128,
     pub fee_amount: i128,
     pub net_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubscriptionCreatedEvent {
+    pub subscription_id: u32,
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub interval_seconds: u64,
+    pub lifetime_cap: Option<i128>,
 }
 
 /// Event emitted when funds are deposited into a subscription vault.

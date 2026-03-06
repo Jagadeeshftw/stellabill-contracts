@@ -11,6 +11,7 @@
 
 // -- Modules ------------------------------------------------------------------
 mod admin;
+mod blocklist;
 mod charge_core;
 mod merchant;
 mod metadata;
@@ -24,6 +25,7 @@ mod types;
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec};
 
 // -- Re-exports ---------------------------------------------------------------
+pub use blocklist::{BlocklistAddedEvent, BlocklistEntry, BlocklistRemovedEvent};
 pub use queries::compute_next_charge_info;
 pub use state_machine::{can_transition, get_allowed_transitions, validate_status_transition};
 pub use types::{
@@ -32,10 +34,11 @@ pub use types::{
     LifetimeCapReachedEvent, MerchantWithdrawalEvent, MetadataDeletedEvent, MetadataSetEvent,
     MigrationExportEvent, NextChargeInfo, OneOffChargedEvent, PlanTemplate, RecoveryEvent,
     RecoveryReason, Subscription, SubscriptionCancelledEvent, SubscriptionChargedEvent,
-    SubscriptionPausedEvent, SubscriptionResumedEvent, SubscriptionStatus, SubscriptionSummary,
-    BILLING_SNAPSHOT_FLAG_CLOSED, BILLING_SNAPSHOT_FLAG_EMPTY_PERIOD,
-    BILLING_SNAPSHOT_FLAG_INTERVAL_CHARGED, BILLING_SNAPSHOT_FLAG_USAGE_CHARGED, MAX_METADATA_KEYS,
-    MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
+    SubscriptionCreatedEvent, SubscriptionPausedEvent, SubscriptionResumedEvent,
+    SubscriptionStatus, SubscriptionSummary, BILLING_SNAPSHOT_FLAG_CLOSED,
+    BILLING_SNAPSHOT_FLAG_EMPTY_PERIOD, BILLING_SNAPSHOT_FLAG_INTERVAL_CHARGED,
+    BILLING_SNAPSHOT_FLAG_USAGE_CHARGED, MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH,
+    MAX_METADATA_VALUE_LENGTH,
 };
 
 /// Maximum subscription ID this contract will ever allocate.
@@ -189,7 +192,7 @@ impl SubscriptionVault {
         Ok(())
     }
 
-    // -- Migration / Export ----------------------------------------------------
+    // -- Migration / Export ---------------------------------------------------
 
     /// **ADMIN ONLY**: Export contract-level configuration for migration tooling.
     pub fn export_contract_snapshot(env: Env, admin: Address) -> Result<ContractSnapshot, Error> {
@@ -416,6 +419,14 @@ impl SubscriptionVault {
         subscription::do_resume_subscription(&env, subscription_id, authorizer)
     }
 
+    pub fn withdraw_subscriber_funds(
+        env: Env,
+        subscription_id: u32,
+        subscriber: Address,
+    ) -> Result<(), Error> {
+        subscription::do_withdraw_subscriber_funds(&env, subscription_id, subscriber)
+    }
+
     pub fn set_usage_cap(
         env: Env,
         subscription_id: u32,
@@ -449,15 +460,6 @@ impl SubscriptionVault {
         amount: i128,
     ) -> Result<(), Error> {
         subscription::do_charge_one_off(&env, subscription_id, merchant, amount)
-    }
-
-    /// Subscriber withdraws their remaining prepaid balance after cancellation.
-    pub fn withdraw_subscriber_funds(
-        env: Env,
-        subscription_id: u32,
-        subscriber: Address,
-    ) -> Result<(), Error> {
-        subscription::do_withdraw_subscriber_funds(&env, subscription_id, subscriber)
     }
 
     // -- Charging -------------------------------------------------------------
@@ -605,6 +607,33 @@ impl SubscriptionVault {
     /// List all metadata keys for a subscription.
     pub fn list_metadata_keys(env: Env, subscription_id: u32) -> Result<Vec<String>, Error> {
         metadata::do_list_metadata_keys(&env, subscription_id)
+    }
+
+    // -- Blocklist ------------------------------------------------------------
+
+    pub fn add_to_blocklist(
+        env: Env,
+        authorizer: Address,
+        subscriber: Address,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), Error> {
+        blocklist::do_add_to_blocklist(&env, authorizer, subscriber, reason)
+    }
+
+    pub fn remove_from_blocklist(
+        env: Env,
+        admin: Address,
+        subscriber: Address,
+    ) -> Result<(), Error> {
+        blocklist::do_remove_from_blocklist(&env, admin, subscriber)
+    }
+
+    pub fn is_blocklisted(env: Env, subscriber: Address) -> bool {
+        blocklist::is_blocklisted(&env, &subscriber)
+    }
+
+    pub fn get_blocklist_entry(env: Env, subscriber: Address) -> Result<BlocklistEntry, Error> {
+        blocklist::get_blocklist_entry(&env, subscriber)
     }
 }
 

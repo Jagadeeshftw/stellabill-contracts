@@ -54,6 +54,12 @@ pub fn do_create_subscription(
     lifetime_cap: Option<i128>,
 ) -> Result<u32, Error> {
     subscriber.require_auth();
+
+    // Blocklist check: prevent blocklisted subscribers from creating subscriptions
+    if crate::blocklist::is_blocklisted(env, &subscriber) {
+        return Err(Error::SubscriberBlocklisted);
+    }
+
     validate_non_negative(amount)?;
 
     if interval_seconds == 0 {
@@ -68,7 +74,6 @@ pub fn do_create_subscription(
     }
 
     let now = env.ledger().timestamp();
-
     let sub = Subscription {
         subscriber: subscriber.clone(),
         merchant: merchant.clone(),
@@ -130,6 +135,11 @@ pub fn do_deposit_funds(
     amount: i128,
 ) -> Result<(), Error> {
     subscriber.require_auth();
+
+    // Blocklist check: prevent blocklisted subscribers from depositing funds
+    if crate::blocklist::is_blocklisted(env, &subscriber) {
+        return Err(Error::SubscriberBlocklisted);
+    }
 
     // CHECKS
     let min_topup: i128 = crate::admin::get_min_topup(env)?;
@@ -333,6 +343,11 @@ pub fn do_create_subscription_from_plan(
     plan_template_id: u32,
 ) -> Result<u32, Error> {
     subscriber.require_auth();
+
+    // Blocklist check: prevent blocklisted subscribers from creating subscriptions
+    if crate::blocklist::is_blocklisted(env, &subscriber) {
+        return Err(Error::SubscriberBlocklisted);
+    }
 
     let plan = get_plan_template(env, plan_template_id)?;
 
