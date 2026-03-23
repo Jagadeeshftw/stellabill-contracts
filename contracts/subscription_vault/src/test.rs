@@ -3,7 +3,7 @@ use crate::{
     Error, OraclePrice, RecoveryReason, Subscription, SubscriptionStatus, SubscriptionVault,
     SubscriptionVaultClient, MAX_SUBSCRIPTION_ID,
 };
-use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec as SorobanVec};
 
 extern crate alloc;
@@ -552,7 +552,7 @@ fn test_subscription_struct_with_lifetime_cap() {
 
 #[test]
 fn test_charge_subscription_basic() {
-    let (env, client, _, admin) = setup_test_env();
+    let (env, client, _, _admin) = setup_test_env();
     env.ledger().with_mut(|li| li.timestamp = T0);
 
     let (id, _, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
@@ -789,7 +789,7 @@ fn test_deposit_funds_basic() {
 #[test]
 #[should_panic(expected = "Error(Contract, #402)")]
 fn test_deposit_funds_below_minimum() {
-    let (env, client, token, _) = setup_test_env();
+    let (env, client, _token, _) = setup_test_env();
     let subscriber = Address::generate(&env);
     let merchant = Address::generate(&env);
     let id = client.create_subscription(
@@ -816,7 +816,7 @@ fn test_rotate_admin() {
 
 #[test]
 fn test_emergency_stop() {
-    let (env, client, _, admin) = setup_test_env();
+    let (_env, client, _, admin) = setup_test_env();
     assert!(!client.get_emergency_stop_status());
     client.enable_emergency_stop(&admin);
     assert!(client.get_emergency_stop_status());
@@ -845,7 +845,7 @@ fn test_create_subscription_blocked_by_emergency_stop() {
 
 #[test]
 fn test_batch_charge() {
-    let (env, client, _, admin) = setup_test_env();
+    let (env, client, _, _admin) = setup_test_env();
     env.ledger().with_mut(|li| li.timestamp = T0);
 
     let (id1, _, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
@@ -1725,7 +1725,7 @@ fn test_withdraw_subscriber_funds_after_cancel() {
 
 #[test]
 fn test_export_contract_snapshot() {
-    let (env, client, _, admin) = setup_test_env();
+    let (_env, client, _, admin) = setup_test_env();
     let snapshot = client.export_contract_snapshot(&admin);
     assert_eq!(snapshot.admin, admin);
     assert_eq!(snapshot.storage_version, 2);
@@ -2443,7 +2443,7 @@ fn test_migration_rejects_usage_flag_change() {
     let new_plan_id = 999u32;
     let malicious_plan = PlanTemplate {
         merchant: merchant.clone(),
-        token: token.address.clone(),
+        token: token.clone(),
         amount: 5_000_000i128,
         interval_seconds: INTERVAL,
         usage_enabled: true, // Mismatch
