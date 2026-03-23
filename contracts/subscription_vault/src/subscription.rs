@@ -364,6 +364,19 @@ pub fn do_cancel_subscription(
     Ok(())
 }
 
+/// Pause a subscription (no charges until resumed).
+///
+/// # Authorization
+/// Only the subscription's `subscriber` or `merchant` may pause.
+/// Any other caller receives [`Error::Forbidden`].
+///
+/// # Transition guard
+/// Only `Active → Paused` is permitted by the state machine.
+/// Calling on an already-`Paused` subscription is idempotent (same-state rule).
+/// Any other source state returns [`Error::InvalidStatusTransition`].
+///
+/// # Events
+/// Emits [`SubscriptionPausedEvent`] on every state-changing call.
 pub fn do_pause_subscription(
     env: &Env,
     subscription_id: u32,
@@ -372,13 +385,45 @@ pub fn do_pause_subscription(
     authorizer.require_auth();
 
     let mut sub = get_subscription(env, subscription_id)?;
-    validate_status_transition(&sub.status, &SubscriptionStatus::Paused)?;
-    sub.status = SubscriptionStatus::Paused;
 
+    // Actor check: only subscriber or merchant may pause.
+    if authorizer != sub.subscriber && authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+
+    validate_status_transition(&sub.status, &SubscriptionStatus::Paused)?;
+
+    // Idempotent: already paused — nothing to do, no event.
+    if sub.status == SubscriptionStatus::Paused {
+        return Ok(());
+    }
+
+    sub.status = SubscriptionStatus::Paused;
     env.storage().instance().set(&subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "sub_paused"), subscription_id),
+        crate::types::SubscriptionPausedEvent {
+            subscription_id,
+            authorizer,
+        },
+    );
+
     Ok(())
 }
 
+/// Resume a paused or insufficient-balance subscription back to `Active`.
+///
+/// # Authorization
+/// Only the subscription's `subscriber` or `merchant` may resume.
+/// Any other caller receives [`Error::Forbidden`].
+///
+/// # Transition guard
+/// `Paused → Active` and `InsufficientBalance → Active` are permitted.
+/// Any other source state (including `Cancelled`) returns [`Error::InvalidStatusTransition`].
+///
+/// # Events
+/// Emits [`SubscriptionResumedEvent`] on every state-changing call.
 pub fn do_resume_subscription(
     env: &Env,
     subscription_id: u32,
@@ -387,10 +432,30 @@ pub fn do_resume_subscription(
     authorizer.require_auth();
 
     let mut sub = get_subscription(env, subscription_id)?;
-    validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
-    sub.status = SubscriptionStatus::Active;
 
+    // Actor check: only subscriber or merchant may resume.
+    if authorizer != sub.subscriber && authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+
+    validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
+
+    // Idempotent: already active — nothing to do, no event.
+    if sub.status == SubscriptionStatus::Active {
+        return Ok(());
+    }
+
+    sub.status = SubscriptionStatus::Active;
     env.storage().instance().set(&subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "sub_resumed"), subscription_id),
+        crate::types::SubscriptionResumedEvent {
+            subscription_id,
+            authorizer,
+        },
+    );
+
     Ok(())
 }
 

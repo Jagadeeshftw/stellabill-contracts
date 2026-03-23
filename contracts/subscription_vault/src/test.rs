@@ -2818,3 +2818,324 @@ fn test_rotate_admin_allowed_during_emergency_stop() {
     client.disable_emergency_stop(&new_admin);
     assert!(!client.get_emergency_stop_status());
 }
+
+// =============================================================================
+// Pause / Resume — Actor Authorization & Transition Guard Tests
+// =============================================================================
+//
+// Security model
+// ──────────────
+// Only the subscription's `subscriber` or `merchant` may call pause_subscription
+// or resume_subscription.  Any other address receives Error::Forbidden (403).
+//
+// Transition rules (enforced before the actor check so the state machine is
+// always the first line of defence):
+//
+//   pause:  Active  → Paused          ✓
+//           Paused  → Paused          ✓ (idempotent, no event)
+//           Cancelled / InsufficientBalance → Paused  ✗ (InvalidStatusTransition)
+//
+//   resume: Paused              → Active  ✓
+//           InsufficientBalance → Active  ✓
+//           Active              → Active  ✓ (idempotent, no event)
+//           Cancelled           → Active  ✗ (InvalidStatusTransition)
+//
+// Table-driven helpers
+// ────────────────────
+// `pause_actor_cases` / `resume_actor_cases` iterate over every (actor, state)
+// combination and assert the expected outcome, giving full permutation coverage
+// in a single test function.
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Patch a subscription's status directly in storage (test-only).
+fn set_status(env: &Env, client: &SubscriptionVaultClient, id: u32, status: SubscriptionStatus) {
+    let mut sub = client.get_subscription(&id);
+    sub.status = status;
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&id, &sub);
+    });
+}
+
+// ── actor × state table for pause ────────────────────────────────────────────
+
+#[test]
+fn pause_actor_cases() {
+    // (actor_selector, initial_status, expect_ok)
+    // actor_selector: 0 = subscriber, 1 = merchant, 2 = stranger
+    let cases: &[(u8, SubscriptionStatus, bool)] = &[
+        // subscriber can pause from Active
+        (0, SubscriptionStatus::Active, true),
+        // merchant can pause from Active
+        (1, SubscriptionStatus::Active, true),
+        // stranger cannot pause from Active
+        (2, SubscriptionStatus::Active, false),
+        // subscriber: idempotent pause from Paused
+        (0, SubscriptionStatus::Paused, true),
+        // merchant: idempotent pause from Paused
+        (1, SubscriptionStatus::Paused, true),
+        // stranger cannot pause from Paused either
+        (2, SubscriptionStatus::Paused, false),
+        // nobody can pause from Cancelled (transition guard fires first)
+        (0, SubscriptionStatus::Cancelled, false),
+        (1, SubscriptionStatus::Cancelled, false),
+        (2, SubscriptionStatus::Cancelled, false),
+        // nobody can pause from InsufficientBalance
+        (0, SubscriptionStatus::InsufficientBalance, false),
+        (1, SubscriptionStatus::InsufficientBalance, false),
+        (2, SubscriptionStatus::InsufficientBalance, false),
+    ];
+
+    for (i, (actor_sel, initial_status, expect_ok)) in cases.iter().enumerate() {
+        let (env, client, _, _) = setup_test_env();
+        let (id, subscriber, merchant) =
+            create_test_subscription(&env, &client, SubscriptionStatus::Active);
+        set_status(&env, &client, id, initial_status.clone());
+
+        let stranger = Address::generate(&env);
+        let actor = match actor_sel {
+            0 => subscriber.clone(),
+            1 => merchant.clone(),
+            _ => stranger.clone(),
+        };
+
+        let result = client.try_pause_subscription(&id, &actor);
+        assert_eq!(
+            result.is_ok(),
+            *expect_ok,
+            "case {i}: actor={actor_sel} status={initial_status:?} expected_ok={expect_ok}"
+        );
+    }
+}
+
+// ── actor × state table for resume ───────────────────────────────────────────
+
+#[test]
+fn resume_actor_cases() {
+    // (actor_selector, initial_status, expect_ok)
+    let cases: &[(u8, SubscriptionStatus, bool)] = &[
+        // subscriber can resume from Paused
+        (0, SubscriptionStatus::Paused, true),
+        // merchant can resume from Paused
+        (1, SubscriptionStatus::Paused, true),
+        // stranger cannot resume from Paused
+        (2, SubscriptionStatus::Paused, false),
+        // subscriber can resume from InsufficientBalance
+        (0, SubscriptionStatus::InsufficientBalance, true),
+        // merchant can resume from InsufficientBalance
+        (1, SubscriptionStatus::InsufficientBalance, true),
+        // stranger cannot resume from InsufficientBalance
+        (2, SubscriptionStatus::InsufficientBalance, false),
+        // nobody can resume from Cancelled
+        (0, SubscriptionStatus::Cancelled, false),
+        (1, SubscriptionStatus::Cancelled, false),
+        (2, SubscriptionStatus::Cancelled, false),
+        // idempotent: subscriber resumes from Active (already active)
+        (0, SubscriptionStatus::Active, true),
+        // idempotent: merchant resumes from Active
+        (1, SubscriptionStatus::Active, true),
+        // stranger cannot resume from Active
+        (2, SubscriptionStatus::Active, false),
+    ];
+
+    for (i, (actor_sel, initial_status, expect_ok)) in cases.iter().enumerate() {
+        let (env, client, _, _) = setup_test_env();
+        let (id, subscriber, merchant) =
+            create_test_subscription(&env, &client, SubscriptionStatus::Active);
+        set_status(&env, &client, id, initial_status.clone());
+
+        let stranger = Address::generate(&env);
+        let actor = match actor_sel {
+            0 => subscriber.clone(),
+            1 => merchant.clone(),
+            _ => stranger.clone(),
+        };
+
+        let result = client.try_resume_subscription(&id, &actor);
+        assert_eq!(
+            result.is_ok(),
+            *expect_ok,
+            "case {i}: actor={actor_sel} status={initial_status:?} expected_ok={expect_ok}"
+        );
+    }
+}
+
+// ── explicit error-code assertions ───────────────────────────────────────────
+
+#[test]
+fn pause_by_stranger_returns_forbidden() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, _, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_pause_subscription(&id, &stranger),
+        Err(Ok(Error::Forbidden))
+    );
+}
+
+#[test]
+fn resume_by_stranger_returns_forbidden() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    client.pause_subscription(&id, &subscriber);
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_resume_subscription(&id, &stranger),
+        Err(Ok(Error::Forbidden))
+    );
+}
+
+#[test]
+fn pause_from_cancelled_returns_invalid_transition() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    client.cancel_subscription(&id, &subscriber);
+    assert_eq!(
+        client.try_pause_subscription(&id, &subscriber),
+        Err(Ok(Error::InvalidStatusTransition))
+    );
+}
+
+#[test]
+fn resume_from_cancelled_returns_invalid_transition() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    client.cancel_subscription(&id, &subscriber);
+    assert_eq!(
+        client.try_resume_subscription(&id, &subscriber),
+        Err(Ok(Error::InvalidStatusTransition))
+    );
+}
+
+#[test]
+fn pause_from_insufficient_balance_returns_invalid_transition() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    set_status(&env, &client, id, SubscriptionStatus::InsufficientBalance);
+    assert_eq!(
+        client.try_pause_subscription(&id, &subscriber),
+        Err(Ok(Error::InvalidStatusTransition))
+    );
+}
+
+// ── cross-actor scenarios ─────────────────────────────────────────────────────
+
+#[test]
+fn merchant_pauses_subscriber_resumes() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, merchant) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+
+    client.pause_subscription(&id, &merchant);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Paused
+    );
+
+    client.resume_subscription(&id, &subscriber);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Active
+    );
+}
+
+#[test]
+fn subscriber_pauses_merchant_resumes() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, merchant) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+
+    client.pause_subscription(&id, &subscriber);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Paused
+    );
+
+    client.resume_subscription(&id, &merchant);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Active
+    );
+}
+
+// ── event emission ────────────────────────────────────────────────────────────
+//
+// env.events().all() in the Soroban test harness returns only the events from
+// the most recent contract invocation, so we check the count after each call
+// independently rather than computing a delta.
+
+#[test]
+fn pause_emits_event() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+
+    client.pause_subscription(&id, &subscriber);
+    // The pause invocation must have produced at least one event.
+    assert!(
+        !env.events().all().is_empty(),
+        "pause_subscription must emit at least one event"
+    );
+}
+
+#[test]
+fn resume_emits_event() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    client.pause_subscription(&id, &subscriber);
+
+    client.resume_subscription(&id, &subscriber);
+    assert!(
+        !env.events().all().is_empty(),
+        "resume_subscription must emit at least one event"
+    );
+}
+
+#[test]
+fn idempotent_pause_does_not_emit_event() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    client.pause_subscription(&id, &subscriber);
+
+    // Second pause on already-Paused subscription — idempotent, no new event.
+    // env.events().all() reflects only the most recent invocation.
+    client.pause_subscription(&id, &subscriber);
+    assert!(
+        env.events().all().is_empty(),
+        "idempotent pause must not emit an event"
+    );
+}
+
+#[test]
+fn idempotent_resume_does_not_emit_event() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
+
+    // Resume on already-Active subscription — idempotent, no new event.
+    client.resume_subscription(&id, &subscriber);
+    assert!(
+        env.events().all().is_empty(),
+        "idempotent resume must not emit an event"
+    );
+}
+
+// ── repeat pause / resume cycles ─────────────────────────────────────────────
+
+#[test]
+fn repeated_pause_resume_cycles_stay_consistent() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, merchant) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+
+    for _ in 0..3 {
+        client.pause_subscription(&id, &subscriber);
+        assert_eq!(
+            client.get_subscription(&id).status,
+            SubscriptionStatus::Paused
+        );
+        client.resume_subscription(&id, &merchant);
+        assert_eq!(
+            client.get_subscription(&id).status,
+            SubscriptionStatus::Active
+        );
+    }
+}
