@@ -3,7 +3,7 @@ use crate::{
     Error, OraclePrice, RecoveryReason, Subscription, SubscriptionStatus, SubscriptionVault,
     SubscriptionVaultClient, MAX_SUBSCRIPTION_ID,
 };
-use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec as SorobanVec};
 
 extern crate alloc;
@@ -1656,6 +1656,192 @@ fn test_merchant_balance_and_withdrawal() {
 
     let balance = client.get_merchant_balance(&merchant);
     assert!(balance > 0);
+}
+
+// -- End-to-end billing lifecycle tests --------------------------------------
+
+#[test]
+fn test_billing_lifecycle_golden_path_end_to_end() {
+    let (env, client, token, _) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let minted = 100_000_000i128;
+    token_admin.mint(&subscriber, &minted);
+
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    let created = client.get_subscription(&id);
+    assert_eq!(created.status, SubscriptionStatus::Active);
+    assert_eq!(created.prepaid_balance, 0);
+    assert_eq!(created.last_payment_timestamp, T0);
+    assert_eq!(client.get_merchant_balance(&merchant), 0);
+
+    client.deposit_funds(&id, &subscriber, &PREPAID);
+    let after_deposit = client.get_subscription(&id);
+    assert_eq!(after_deposit.status, SubscriptionStatus::Active);
+    assert_eq!(after_deposit.prepaid_balance, PREPAID);
+    assert_eq!(token_client.balance(&subscriber), minted - PREPAID);
+    assert_eq!(token_client.balance(&client.address), PREPAID);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    client.charge_subscription(&id);
+    let after_first_charge = client.get_subscription(&id);
+    assert_eq!(after_first_charge.status, SubscriptionStatus::Active);
+    assert_eq!(after_first_charge.prepaid_balance, PREPAID - AMOUNT);
+    assert_eq!(after_first_charge.last_payment_timestamp, T0 + INTERVAL);
+    assert_eq!(after_first_charge.lifetime_charged, AMOUNT);
+    assert_eq!(client.get_merchant_balance(&merchant), AMOUNT);
+
+    env.ledger().set_timestamp(T0 + (2 * INTERVAL));
+    client.charge_subscription(&id);
+    let after_second_charge = client.get_subscription(&id);
+    assert_eq!(after_second_charge.status, SubscriptionStatus::Active);
+    assert_eq!(after_second_charge.prepaid_balance, PREPAID - (2 * AMOUNT));
+    assert_eq!(
+        after_second_charge.last_payment_timestamp,
+        T0 + (2 * INTERVAL)
+    );
+    assert_eq!(after_second_charge.lifetime_charged, 2 * AMOUNT);
+    assert_eq!(client.get_merchant_balance(&merchant), 2 * AMOUNT);
+
+    let statements = client.get_sub_statements_offset(&id, &0, &10, &true);
+    assert_eq!(statements.total, 2);
+    assert_eq!(statements.statements.len(), 2);
+
+    let newest = statements.statements.get(0).unwrap();
+    assert_eq!(newest.sequence, 1);
+    assert_eq!(newest.charged_at, T0 + (2 * INTERVAL));
+    assert_eq!(newest.period_start, T0 + INTERVAL);
+    assert_eq!(newest.period_end, T0 + (2 * INTERVAL));
+    assert_eq!(newest.amount, AMOUNT);
+    assert_eq!(newest.merchant, merchant.clone());
+    assert_eq!(newest.kind, crate::BillingChargeKind::Interval);
+
+    let oldest = statements.statements.get(1).unwrap();
+    assert_eq!(oldest.sequence, 0);
+    assert_eq!(oldest.charged_at, T0 + INTERVAL);
+    assert_eq!(oldest.period_start, T0);
+    assert_eq!(oldest.period_end, T0 + INTERVAL);
+    assert_eq!(oldest.amount, AMOUNT);
+    assert_eq!(oldest.merchant, merchant.clone());
+    assert_eq!(oldest.kind, crate::BillingChargeKind::Interval);
+
+    let first_page = client.get_sub_statements_cursor(&id, &None::<u32>, &1, &true);
+    assert_eq!(first_page.total, 2);
+    assert_eq!(first_page.statements.len(), 1);
+    assert_eq!(first_page.statements.get(0).unwrap().sequence, 1);
+    assert_eq!(first_page.next_cursor, Some(0));
+
+    let second_page = client.get_sub_statements_cursor(&id, &first_page.next_cursor, &1, &true);
+    assert_eq!(second_page.total, 2);
+    assert_eq!(second_page.statements.len(), 1);
+    assert_eq!(second_page.statements.get(0).unwrap().sequence, 0);
+    assert_eq!(second_page.next_cursor, None);
+
+    let merchant_wallet_before = token_client.balance(&merchant);
+    client.withdraw_merchant_funds(&merchant, &(2 * AMOUNT));
+    assert_eq!(client.get_merchant_balance(&merchant), 0);
+    assert_eq!(
+        token_client.balance(&merchant),
+        merchant_wallet_before + (2 * AMOUNT)
+    );
+    assert_eq!(
+        token_client.balance(&client.address),
+        PREPAID - (2 * AMOUNT)
+    );
+
+    client.cancel_subscription(&id, &subscriber);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Cancelled
+    );
+
+    client.withdraw_subscriber_funds(&id, &subscriber);
+    let closed_out = client.get_subscription(&id);
+    assert_eq!(closed_out.prepaid_balance, 0);
+    assert_eq!(token_client.balance(&client.address), 0);
+    assert_eq!(token_client.balance(&subscriber), minted - (2 * AMOUNT));
+}
+
+#[test]
+fn test_billing_lifecycle_delayed_charge_and_min_topup_progression() {
+    let (env, client, token, _) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    token_admin.mint(&subscriber, &50_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &19_000_000i128);
+
+    let delayed_charge_at = T0 + (2 * INTERVAL) + 77;
+    env.ledger().set_timestamp(delayed_charge_at);
+    client.charge_subscription(&id);
+
+    let after_delayed_charge = client.get_subscription(&id);
+    assert_eq!(after_delayed_charge.status, SubscriptionStatus::Active);
+    assert_eq!(after_delayed_charge.prepaid_balance, 9_000_000i128);
+    assert_eq!(
+        after_delayed_charge.last_payment_timestamp,
+        delayed_charge_at
+    );
+    assert_eq!(after_delayed_charge.lifetime_charged, AMOUNT);
+    assert_eq!(client.get_merchant_balance(&merchant), AMOUNT);
+
+    client.deposit_funds(&id, &subscriber, &1_000_000i128);
+    let after_topup = client.get_subscription(&id);
+    assert_eq!(after_topup.prepaid_balance, AMOUNT);
+
+    env.ledger().set_timestamp(delayed_charge_at + INTERVAL);
+    client.charge_subscription(&id);
+
+    let after_second_charge = client.get_subscription(&id);
+    assert_eq!(after_second_charge.status, SubscriptionStatus::Active);
+    assert_eq!(after_second_charge.prepaid_balance, 0);
+    assert_eq!(
+        after_second_charge.last_payment_timestamp,
+        delayed_charge_at + INTERVAL
+    );
+    assert_eq!(after_second_charge.lifetime_charged, 2 * AMOUNT);
+    assert_eq!(client.get_merchant_balance(&merchant), 2 * AMOUNT);
+
+    let statements = client.get_sub_statements_offset(&id, &0, &10, &false);
+    assert_eq!(statements.total, 2);
+    assert_eq!(statements.statements.len(), 2);
+
+    let first = statements.statements.get(0).unwrap();
+    assert_eq!(first.sequence, 0);
+    assert_eq!(first.period_start, T0);
+    assert_eq!(first.period_end, delayed_charge_at);
+    assert_eq!(first.amount, AMOUNT);
+
+    let second = statements.statements.get(1).unwrap();
+    assert_eq!(second.sequence, 1);
+    assert_eq!(second.period_start, delayed_charge_at);
+    assert_eq!(second.period_end, delayed_charge_at + INTERVAL);
+    assert_eq!(second.amount, AMOUNT);
+
+    assert_eq!(token_client.balance(&client.address), 20_000_000i128);
 }
 
 // -- List subscriptions by subscriber test ------------------------------------
