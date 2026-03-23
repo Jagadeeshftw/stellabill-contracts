@@ -1418,10 +1418,23 @@ fn test_partial_refund_repeated_debits_are_cumulative() {
     let subscriber = Address::generate(&env);
     let merchant = Address::generate(&env);
 
-    client.init(&token_contract, &6, &vault_admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.init(
+        &token_contract,
+        &6,
+        &vault_admin,
+        &1_000_000i128,
+        &(7 * 24 * 60 * 60),
+    );
     token_admin.mint(&subscriber, &30_000_000i128);
 
-    let sub_id = client.create_subscription(&subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+    let sub_id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
     client.deposit_funds(&sub_id, &subscriber, &30_000_000i128);
 
     // Three successive partial refunds of 5 USDC each.
@@ -1452,10 +1465,23 @@ fn test_partial_refund_cumulative_exact_drain_then_over_refund_fails() {
     let subscriber = Address::generate(&env);
     let merchant = Address::generate(&env);
 
-    client.init(&token_contract, &6, &vault_admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.init(
+        &token_contract,
+        &6,
+        &vault_admin,
+        &1_000_000i128,
+        &(7 * 24 * 60 * 60),
+    );
     token_admin.mint(&subscriber, &10_000_000i128);
 
-    let sub_id = client.create_subscription(&subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+    let sub_id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
     client.deposit_funds(&sub_id, &subscriber, &10_000_000i128);
 
     // Refund the full balance as two equal halves.
@@ -1489,10 +1515,23 @@ fn test_partial_refund_full_balance_as_partial_succeeds() {
     let subscriber = Address::generate(&env);
     let merchant = Address::generate(&env);
 
-    client.init(&token_contract, &6, &vault_admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.init(
+        &token_contract,
+        &6,
+        &vault_admin,
+        &1_000_000i128,
+        &(7 * 24 * 60 * 60),
+    );
     token_admin.mint(&subscriber, &20_000_000i128);
 
-    let sub_id = client.create_subscription(&subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+    let sub_id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
     client.deposit_funds(&sub_id, &subscriber, &20_000_000i128);
 
     // Refund the entire prepaid balance in one call.
@@ -1522,10 +1561,23 @@ fn test_partial_refund_after_cancellation_succeeds() {
     let subscriber = Address::generate(&env);
     let merchant = Address::generate(&env);
 
-    client.init(&token_contract, &6, &vault_admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.init(
+        &token_contract,
+        &6,
+        &vault_admin,
+        &1_000_000i128,
+        &(7 * 24 * 60 * 60),
+    );
     token_admin.mint(&subscriber, &15_000_000i128);
 
-    let sub_id = client.create_subscription(&subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+    let sub_id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
     client.deposit_funds(&sub_id, &subscriber, &15_000_000i128);
     client.cancel_subscription(&sub_id, &subscriber);
 
@@ -1556,10 +1608,23 @@ fn test_partial_refund_emits_event() {
     let subscriber = Address::generate(&env);
     let merchant = Address::generate(&env);
 
-    client.init(&token_contract, &6, &vault_admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.init(
+        &token_contract,
+        &6,
+        &vault_admin,
+        &1_000_000i128,
+        &(7 * 24 * 60 * 60),
+    );
     token_admin.mint(&subscriber, &10_000_000i128);
 
-    let sub_id = client.create_subscription(&subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>);
+    let sub_id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
     client.deposit_funds(&sub_id, &subscriber, &10_000_000i128);
 
     client.partial_refund(&vault_admin, &sub_id, &subscriber, &3_000_000i128);
