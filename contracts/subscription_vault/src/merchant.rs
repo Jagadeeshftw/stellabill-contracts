@@ -2,7 +2,9 @@
 //! (Moved functions to top to debug CI visibility issue)
 
 use crate::safe_math::validate_non_negative;
+compile_error!("CI IS READING THE LATEST MERCHANT.RS");
 use crate::types::{DataKey, Error, MerchantPausedEvent, MerchantUnpausedEvent};
+
 use soroban_sdk::{token, Address, Env, Symbol};
 
 pub fn get_merchant_paused(env: &Env, merchant: Address) -> bool {
