@@ -3139,3 +3139,309 @@ fn repeated_pause_resume_cycles_stay_consistent() {
         );
     }
 }
+
+// ── Oracle validation tests ───────────────────────────────────────────────────
+
+/// Helper: register oracle, configure vault, create subscription, deposit funds.
+/// Returns (subscription_id, subscriber, merchant, oracle_client).
+fn setup_oracle_env<'a>(
+    env: &'a Env,
+    client: &'a SubscriptionVaultClient<'a>,
+    token: &Address,
+    admin: &Address,
+    price: i128,
+    price_ts: u64,
+    max_age_seconds: u64,
+) -> (u32, Address, Address, MockOracleClient<'a>) {
+    let oracle_id = env.register(MockOracle, ());
+    let oracle = MockOracleClient::new(env, &oracle_id);
+    oracle.set_price(&price, &price_ts);
+    client.set_oracle_config(admin, &true, &Some(oracle_id), &max_age_seconds);
+
+    let subscriber = Address::generate(env);
+    let merchant = Address::generate(env);
+    soroban_sdk::token::StellarAssetClient::new(env, token).mint(&subscriber, &1_000_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &20_000_000i128,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &200_000_000i128);
+    (id, subscriber, merchant, oracle)
+}
+
+// --- set_oracle_config validation ---
+
+#[test]
+fn test_set_oracle_config_enabled_without_address_fails() {
+    let (env, client, _token, admin) = setup_test_env();
+    let result = client.try_set_oracle_config(&admin, &true, &None::<Address>, &60u64);
+    assert_eq!(result, Err(Ok(Error::OracleNotConfigured)));
+}
+
+#[test]
+fn test_set_oracle_config_enabled_with_zero_max_age_fails() {
+    let (env, client, _token, admin) = setup_test_env();
+    let oracle_id = env.register(MockOracle, ());
+    let result = client.try_set_oracle_config(&admin, &true, &Some(oracle_id), &0u64);
+    assert_eq!(result, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn test_set_oracle_config_disabled_with_zero_max_age_succeeds() {
+    // Disabling oracle does not require a valid max_age.
+    let (env, client, _token, admin) = setup_test_env();
+    let oracle_id = env.register(MockOracle, ());
+    client.set_oracle_config(&admin, &false, &Some(oracle_id), &0u64);
+    let cfg = client.get_oracle_config();
+    assert!(!cfg.enabled);
+}
+
+#[test]
+fn test_set_oracle_config_disabled_with_no_address_succeeds() {
+    let (_env, client, _token, admin) = setup_test_env();
+    client.set_oracle_config(&admin, &false, &None::<Address>, &0u64);
+    let cfg = client.get_oracle_config();
+    assert!(!cfg.enabled);
+    assert!(cfg.oracle.is_none());
+}
+
+// --- Oracle disabled: passthrough ---
+
+#[test]
+fn test_oracle_disabled_charge_uses_subscription_amount_directly() {
+    let (env, client, token, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+
+    // Ensure oracle is off (default).
+    let cfg = client.get_oracle_config();
+    assert!(!cfg.enabled);
+
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&subscriber, &100_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    client.charge_subscription(&id);
+
+    // Merchant receives exactly AMOUNT (no oracle conversion).
+    assert_eq!(client.get_merchant_balance(&merchant), AMOUNT);
+}
+
+// --- Zero price rejection ---
+
+#[test]
+fn test_oracle_zero_price_rejected() {
+    let (env, client, token, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+    let (id, _sub, _mer, _oracle) =
+        setup_oracle_env(&env, &client, &token, &admin, 0i128, T0, 3600u64);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::OraclePriceInvalid)));
+}
+
+// --- Negative price rejection ---
+
+#[test]
+fn test_oracle_negative_price_rejected() {
+    let (env, client, token, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+    let (id, _sub, _mer, _oracle) =
+        setup_oracle_env(&env, &client, &token, &admin, -1_000_000i128, T0, 3600u64);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::OraclePriceInvalid)));
+}
+
+// --- Unavailable price (timestamp == 0) ---
+
+#[test]
+fn test_oracle_zero_timestamp_price_unavailable() {
+    let (env, client, token, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+    // price=2_000_000 but timestamp=0 → OraclePriceUnavailable
+    let (id, _sub, _mer, _oracle) =
+        setup_oracle_env(&env, &client, &token, &admin, 2_000_000i128, 0u64, 3600u64);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::OraclePriceUnavailable)));
+}
+
+// --- Staleness boundary ---
+
+#[test]
+fn test_oracle_price_exactly_at_max_age_boundary_accepted() {
+    // now - price.timestamp == max_age_seconds → still fresh (not stale).
+    let (env, client, token, admin) = setup_test_env();
+    let max_age = 3600u64;
+    // Use a price_ts large enough that charge_ts - INTERVAL > 0.
+    let price_ts = INTERVAL + max_age; // e.g. 2592000 + 3600
+    let charge_ts = price_ts + max_age; // age == max_age at charge time
+
+    let oracle_id = env.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+    oracle.set_price(&2_000_000i128, &price_ts);
+    client.set_oracle_config(&admin, &true, &Some(oracle_id), &max_age);
+
+    env.ledger().set_timestamp(T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&subscriber, &1_000_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &20_000_000i128,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &200_000_000i128);
+
+    // Set last_payment_timestamp so interval has elapsed by charge_ts.
+    let mut sub = client.get_subscription(&id);
+    sub.last_payment_timestamp = charge_ts - INTERVAL; // positive, interval elapsed
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&id, &sub);
+    });
+
+    env.ledger().set_timestamp(charge_ts);
+    // Should succeed — price age == max_age_seconds (boundary, not stale).
+    client.charge_subscription(&id);
+    assert_eq!(client.get_merchant_balance(&merchant), 10_000_000i128);
+}
+
+#[test]
+fn test_oracle_price_one_second_past_max_age_rejected() {
+    // now - price.timestamp == max_age_seconds + 1 → stale.
+    let (env, client, token, admin) = setup_test_env();
+    let max_age = 3600u64;
+    let price_ts = T0;
+    let charge_ts = price_ts + max_age + 1;
+
+    let oracle_id = env.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+    oracle.set_price(&2_000_000i128, &price_ts);
+    client.set_oracle_config(&admin, &true, &Some(oracle_id), &max_age);
+
+    env.ledger().set_timestamp(T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&subscriber, &1_000_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &20_000_000i128,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &200_000_000i128);
+
+    // Set last_payment_timestamp so interval has elapsed by charge_ts.
+    let mut sub = client.get_subscription(&id);
+    sub.last_payment_timestamp = charge_ts.saturating_sub(INTERVAL);
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&id, &sub);
+    });
+
+    env.ledger().set_timestamp(charge_ts);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::OraclePriceStale)));
+}
+
+// --- Oracle not configured but enabled ---
+
+#[test]
+fn test_oracle_enabled_no_address_stored_returns_not_configured() {
+    // Manually store enabled=true without an oracle address to simulate
+    // a misconfigured state (bypassing set_oracle_config validation).
+    let (env, client, token, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+
+    // Force-write enabled=true with no oracle address directly into storage.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, "oracle_enabled"), &true);
+        // oracle_addr key intentionally absent.
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, "oracle_max_age"), &3600u64);
+    });
+
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&subscriber, &100_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::OracleNotConfigured)));
+}
+
+// --- Charge does not mutate balances on oracle error ---
+
+#[test]
+fn test_oracle_error_does_not_mutate_balances() {
+    let (env, client, token, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+    // Zero price → OraclePriceInvalid
+    let (id, _sub, merchant, _oracle) =
+        setup_oracle_env(&env, &client, &token, &admin, 0i128, T0, 3600u64);
+
+    let balance_before = client.get_subscription(&id).prepaid_balance;
+    let merchant_before = client.get_merchant_balance(&merchant);
+
+    env.ledger().set_timestamp(T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    assert_eq!(client.get_subscription(&id).prepaid_balance, balance_before);
+    assert_eq!(client.get_merchant_balance(&merchant), merchant_before);
+}
+
+// --- get_oracle_config round-trip ---
+
+#[test]
+fn test_get_oracle_config_reflects_set_values() {
+    let (env, client, _token, admin) = setup_test_env();
+    let oracle_id = env.register(MockOracle, ());
+    client.set_oracle_config(&admin, &true, &Some(oracle_id.clone()), &120u64);
+
+    let cfg = client.get_oracle_config();
+    assert!(cfg.enabled);
+    assert_eq!(cfg.oracle, Some(oracle_id));
+    assert_eq!(cfg.max_age_seconds, 120u64);
+}
+
+#[test]
+fn test_get_oracle_config_default_is_disabled() {
+    let (_env, client, _token, _admin) = setup_test_env();
+    let cfg = client.get_oracle_config();
+    assert!(!cfg.enabled);
+    assert!(cfg.oracle.is_none());
+    assert_eq!(cfg.max_age_seconds, 0u64);
+}
