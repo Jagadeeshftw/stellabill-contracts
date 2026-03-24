@@ -111,6 +111,9 @@ pub struct Subscription {
     /// When `lifetime_cap` is `Some(cap)` and `lifetime_charged >= cap`, no
     /// further charges are processed and the subscription transitions to `Cancelled`.
     pub lifetime_charged: i128,
+    /// Timestamp when the current grace period started, if any.
+    /// Used to track grace period duration and expiration.
+    pub grace_start_timestamp: Option<u64>,
 }
 
 /// Detailed error information for insufficient balance scenarios.
@@ -725,4 +728,24 @@ pub struct MerchantConfig {
     pub fee_address: Option<Address>,
     pub redirect_url: String, // e.g., for off-chain success callbacks
     pub is_paused: bool,      // Global pause for all merchant plans
+}
+
+/// Event emitted when a subscription enters the grace period after a missed charge.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GracePeriodEnteredEvent {
+    pub subscription_id: u32,
+    /// Ledger timestamp when the grace window expires.
+    pub grace_expires: u64,
+    /// Ledger timestamp when the grace period was entered.
+    pub timestamp: u64,
+}
+
+/// Event emitted when a subscription's grace period expires without recovery.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GracePeriodExpiredEvent {
+    pub subscription_id: u32,
+    /// Ledger timestamp when expiry was detected.
+    pub timestamp: u64,
 }

@@ -258,6 +258,7 @@ pub fn do_create_subscription_with_token(
         usage_enabled,
         lifetime_cap,
         lifetime_charged: 0i128,
+        grace_start_timestamp: None,
     };
 
     // Allocate ID with overflow / limit guard.
@@ -736,6 +737,7 @@ pub fn do_create_subscription_from_plan(
         usage_enabled: plan.usage_enabled,
         lifetime_cap: plan.lifetime_cap,
         lifetime_charged: 0i128,
+        grace_start_timestamp: None,
     };
 
     env.storage().instance().set(&id, &sub);

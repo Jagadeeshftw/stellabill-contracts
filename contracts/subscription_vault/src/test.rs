@@ -1,9 +1,10 @@
+
 use crate::{
     can_transition, compute_next_charge_info, get_allowed_transitions, validate_status_transition,
     AdminRotatedEvent, Error, OraclePrice, RecoveryReason, Subscription, SubscriptionStatus,
     SubscriptionVault, SubscriptionVaultClient, MAX_SUBSCRIPTION_ID,
 };
-use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec as SorobanVec};
 
 extern crate alloc;
@@ -557,6 +558,7 @@ fn test_subscription_struct_status_field() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.lifetime_cap, None);
@@ -579,6 +581,7 @@ fn test_subscription_struct_with_lifetime_cap() {
         usage_enabled: false,
         lifetime_cap: Some(cap),
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     assert_eq!(sub.lifetime_cap, Some(cap));
     assert_eq!(sub.lifetime_charged, 0);
@@ -937,7 +940,10 @@ fn test_batch_charge_matches_single_charge_semantics_for_identical_inputs() {
     let single_snapshots = snapshot_subscriptions(&client_single, &ids_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
         assert_eq!(batch_sub.lifetime_charged, single_sub.lifetime_charged);
     }
@@ -982,8 +988,20 @@ fn test_batch_charge_mixed_results_preserve_single_path_order_and_error_codes() 
     env_batch.ledger().set_timestamp(T0 + INTERVAL + 1);
     env_single.ledger().set_timestamp(T0 + INTERVAL + 1);
 
-    let ids_batch = [valid_batch, low_batch, paused_batch, 999_999u32, valid_batch];
-    let ids_single = [valid_single, low_single, paused_single, 999_999u32, valid_single];
+    let ids_batch = [
+        valid_batch,
+        low_batch,
+        paused_batch,
+        999_999u32,
+        valid_batch,
+    ];
+    let ids_single = [
+        valid_single,
+        low_single,
+        paused_single,
+        999_999u32,
+        valid_single,
+    ];
 
     let batch_results = collect_batch_result_codes(&env_batch, &client_batch, &ids_batch);
     let single_results = collect_single_charge_result_codes(&client_single, &ids_single);
@@ -1006,7 +1024,10 @@ fn test_batch_charge_mixed_results_preserve_single_path_order_and_error_codes() 
     let single_snapshots = snapshot_subscriptions(&client_single, &tracked_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
     }
 
@@ -1076,7 +1097,10 @@ fn test_batch_charge_failed_items_match_single_path_without_cross_item_side_effe
     let single_snapshots = snapshot_subscriptions(&client_single, &ids_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
     }
 
@@ -1113,8 +1137,10 @@ fn test_batch_charge_high_volume_list_matches_single_path_semantics() {
         } else {
             SubscriptionStatus::Active
         };
-        let (id_batch, _, merchant_batch) = create_test_subscription(&env_batch, &client_batch, status.clone());
-        let (id_single, _, merchant_single) = create_test_subscription(&env_single, &client_single, status);
+        let (id_batch, _, merchant_batch) =
+            create_test_subscription(&env_batch, &client_batch, status.clone());
+        let (id_single, _, merchant_single) =
+            create_test_subscription(&env_single, &client_single, status);
 
         let balance = if idx % 2 == 0 { PREPAID } else { AMOUNT - 1 };
         seed_balance(&env_batch, &client_batch, id_batch, balance);
@@ -1146,7 +1172,10 @@ fn test_batch_charge_high_volume_list_matches_single_path_semantics() {
     let single_snapshots = snapshot_subscriptions(&client_single, &ids_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
     }
 
@@ -1187,6 +1216,7 @@ fn test_compute_next_charge_info_active() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert_eq!(info.next_charge_timestamp, T0 + INTERVAL);
@@ -1208,6 +1238,7 @@ fn test_compute_next_charge_info_paused() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(!info.is_charge_expected);
@@ -1229,6 +1260,7 @@ fn test_compute_next_charge_info_cancelled() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(!info.is_charge_expected);
@@ -1249,6 +1281,7 @@ fn test_compute_next_charge_info_insufficient_balance() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(info.is_charge_expected);
@@ -1269,6 +1302,7 @@ fn test_compute_next_charge_info_overflow_protection() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(info.is_charge_expected);
@@ -4305,4 +4339,445 @@ fn test_get_oracle_config_default_is_disabled() {
     assert!(!cfg.enabled);
     assert!(cfg.oracle.is_none());
     assert_eq!(cfg.max_age_seconds, 0u64);
+}
+
+// =============================================================================
+// Grace Period Semantics Tests
+// =============================================================================
+
+/// Helper: create subscription, seed balance, advance time into grace window.
+/// Returns (sub_id, subscriber, merchant).
+fn setup_grace_env(env: &Env, client: &SubscriptionVaultClient) -> (u32, Address, Address) {
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, subscriber, merchant) =
+        create_test_subscription(env, client, SubscriptionStatus::Active);
+    // Seed less than one full interval charge — forces InsufficientBalance on first attempt.
+    seed_balance(env, client, id, AMOUNT - 1);
+    (id, subscriber, merchant)
+}
+
+// --- Entry: Active → GracePeriod on low-balance charge attempt ---------------
+
+#[test]
+fn test_grace_period_entered_on_low_balance() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, _, _) = setup_grace_env(&env, &client);
+
+    // Advance to exactly the interval boundary — charge attempt should enter grace.
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let result = client.try_charge_subscription(&id);
+    assert!(result.is_ok()); // charge deferred to grace period
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.status, SubscriptionStatus::GracePeriod);
+}
+
+#[test]
+fn test_grace_period_entered_emits_event() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, _, _) = setup_grace_env(&env, &client);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+    // At least one event must be present from the grace-entry call.
+    assert!(!env.events().all().is_empty());
+}
+
+// --- No grace configured → goes straight to InsufficientBalance ---------------
+
+#[test]
+fn test_no_grace_period_goes_to_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    // grace_period = 0 → no grace window.
+    client.init(&token, &6, &admin, &1_000_000i128, &0u64);
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    seed_balance(&env, &client, id, AMOUNT - 1);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    // No grace configured — status should be InsufficientBalance, not GracePeriod.
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.status, SubscriptionStatus::InsufficientBalance);
+}
+
+// --- Grace period: charge retried within window succeeds → Active -------------
+
+#[test]
+fn test_grace_period_recovery_on_topup_then_charge() {
+    let (env, client, token, _) = setup_test_env();
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_admin.mint(&subscriber, &100_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    seed_balance(&env, &client, id, AMOUNT - 1);
+
+    // Enter grace period.
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::GracePeriod
+    );
+
+    // Top-up to cover the charge.
+    client.deposit_funds(&id, &subscriber, &AMOUNT);
+
+    // Retry charge within grace window — should succeed and recover to Active.
+    let grace = 7 * 24 * 60 * 60u64;
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL + grace / 2);
+    client.charge_subscription(&id);
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.lifetime_charged, AMOUNT);
+}
+
+// --- Grace period expiry → InsufficientBalance --------------------------------
+
+#[test]
+fn test_grace_period_expires_to_insufficient_balance() {
+    let (env, client, _, _) = setup_test_env();
+    let grace = 7 * 24 * 60 * 60u64;
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, _, _) = setup_grace_env(&env, &client);
+
+    // Enter grace period.
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::GracePeriod
+    );
+
+    // Advance past grace expiry without topping up.
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL + grace + 1);
+    let _ = client.try_charge_subscription(&id);
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.status, SubscriptionStatus::InsufficientBalance);
+}
+
+#[test]
+fn test_grace_period_expiry_emits_event() {
+    let (env, client, _, _) = setup_test_env();
+    let grace = 7 * 24 * 60 * 60u64;
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, _, _) = setup_grace_env(&env, &client);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL + grace + 1);
+    let _ = client.try_charge_subscription(&id);
+    assert!(!env.events().all().is_empty());
+}
+
+// --- Exact boundary: grace_expires - 1 still in grace ------------------------
+
+#[test]
+fn test_grace_boundary_one_second_before_expiry_still_grace() {
+    let (env, client, _, _) = setup_test_env();
+    let grace = 7 * 24 * 60 * 60u64;
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, _, _) = setup_grace_env(&env, &client);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    // One second before expiry — still in grace.
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL + grace - 1);
+    let _ = client.try_charge_subscription(&id);
+
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::GracePeriod
+    );
+}
+
+// --- Exact boundary: grace_expires exactly → expired -------------------------
+
+#[test]
+fn test_grace_boundary_at_exact_expiry_is_expired() {
+    let (env, client, _, _) = setup_test_env();
+    let grace = 7 * 24 * 60 * 60u64;
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, _, _) = setup_grace_env(&env, &client);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    // Exactly at expiry — should be treated as expired.
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL + grace);
+    let _ = client.try_charge_subscription(&id);
+
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::InsufficientBalance
+    );
+}
+
+// --- Pause/cancel from GracePeriod -------------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #400)")]
+fn test_pause_from_grace_period_blocked_by_state_machine() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = setup_grace_env(&env, &client);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::GracePeriod
+    );
+
+    // Pause from GracePeriod is not in the allowed transitions.
+    client.pause_subscription(&id, &subscriber);
+}
+
+#[test]
+fn test_cancel_from_grace_period_succeeds() {
+    let (env, client, _, _) = setup_test_env();
+    let (id, subscriber, _) = setup_grace_env(&env, &client);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::GracePeriod
+    );
+
+    client.cancel_subscription(&id, &subscriber);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Cancelled
+    );
+}
+
+// --- Resume from GracePeriod (via InsufficientBalance) → Active ---------------
+
+#[test]
+fn test_resume_from_insufficient_balance_after_grace_expiry() {
+    let (env, client, token, _) = setup_test_env();
+    let grace = 7 * 24 * 60 * 60u64;
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_admin.mint(&subscriber, &100_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    seed_balance(&env, &client, id, AMOUNT - 1);
+
+    // Enter grace.
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    // Expire grace.
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL + grace + 1);
+    let _ = client.try_charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::InsufficientBalance
+    );
+
+    // Subscriber tops up and resumes.
+    client.deposit_funds(&id, &subscriber, &AMOUNT);
+    client.resume_subscription(&id, &subscriber);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Active
+    );
+}
+
+// --- GracePeriod in batch_charge matches single-charge semantics --------------
+
+#[test]
+fn test_batch_charge_grace_period_matches_single_charge() {
+    let (env_b, client_b, _, _) = setup_test_env();
+    let (env_s, client_s, _, _) = setup_test_env();
+
+    env_b.ledger().set_timestamp(T0);
+    env_s.ledger().set_timestamp(T0);
+
+    let (id_b, _, _) = create_test_subscription(&env_b, &client_b, SubscriptionStatus::Active);
+    let (id_s, _, _) = create_test_subscription(&env_s, &client_s, SubscriptionStatus::Active);
+    // Low balance — not enough for full charge.
+    seed_balance(&env_b, &client_b, id_b, AMOUNT - 1);
+    seed_balance(&env_s, &client_s, id_s, AMOUNT - 1);
+
+    env_b.ledger().set_timestamp(T0 + INTERVAL);
+    env_s.ledger().set_timestamp(T0 + INTERVAL);
+
+    let batch_results = collect_batch_result_codes(&env_b, &client_b, &[id_b]);
+    let single_results = collect_single_charge_result_codes(&client_s, &[id_s]);
+
+    assert_eq!(batch_results, single_results);
+    assert_eq!(
+        client_b.get_subscription(&id_b).status,
+        client_s.get_subscription(&id_s).status
+    );
+    assert_eq!(
+        client_b.get_subscription(&id_b).status,
+        SubscriptionStatus::GracePeriod
+    );
+}
+
+// --- Deposit during grace period is allowed -----------------------------------
+
+#[test]
+fn test_deposit_allowed_during_grace_period() {
+    let (env, client, token, _) = setup_test_env();
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_admin.mint(&subscriber, &100_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    seed_balance(&env, &client, id, AMOUNT - 1);
+
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::GracePeriod
+    );
+
+    // Deposit should succeed even in GracePeriod.
+    assert!(client.try_deposit_funds(&id, &subscriber, &AMOUNT).is_ok());
+}
+
+// --- Idempotency: second charge attempt in same period during grace ----------
+
+#[test]
+fn test_replay_during_grace_period_returns_replay_error() {
+    let (env, client, token, _) = setup_test_env();
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    let grace = 7 * 24 * 60 * 60u64;
+
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_admin.mint(&subscriber, &100_000_000i128);
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    seed_balance(&env, &client, id, AMOUNT - 1);
+
+    // Enter grace.
+    env.ledger().with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let _ = client.try_charge_subscription(&id);
+
+    // Top-up and successfully charge (recovers to Active, records charged period).
+    client.deposit_funds(&id, &subscriber, &(AMOUNT * 2));
+    client.charge_subscription(&id);
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Active
+    );
+
+    // Same period — replay protection fires.
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::Replay)));
+}
+
+// --- GracePeriod → state machine helper coverage ----------------------------
+
+#[test]
+fn test_state_machine_grace_period_valid_transitions() {
+    assert!(validate_status_transition(
+        &SubscriptionStatus::GracePeriod,
+        &SubscriptionStatus::Active
+    )
+    .is_ok());
+    assert!(validate_status_transition(
+        &SubscriptionStatus::GracePeriod,
+        &SubscriptionStatus::Cancelled
+    )
+    .is_ok());
+    assert!(validate_status_transition(
+        &SubscriptionStatus::GracePeriod,
+        &SubscriptionStatus::InsufficientBalance
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_state_machine_grace_period_invalid_transitions() {
+    assert_eq!(
+        validate_status_transition(
+            &SubscriptionStatus::GracePeriod,
+            &SubscriptionStatus::Paused
+        ),
+        Err(Error::InvalidStatusTransition)
+    );
+}
+
+#[test]
+fn test_get_allowed_transitions_grace_period() {
+    let targets = get_allowed_transitions(&SubscriptionStatus::GracePeriod);
+    assert_eq!(targets.len(), 3);
+    assert!(targets.contains(&SubscriptionStatus::Active));
+    assert!(targets.contains(&SubscriptionStatus::Cancelled));
+    assert!(targets.contains(&SubscriptionStatus::InsufficientBalance));
+    assert!(!targets.contains(&SubscriptionStatus::Paused));
 }

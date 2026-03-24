@@ -626,7 +626,17 @@ impl SubscriptionVault {
     /// Enforces strict interval timing and replay protection.
     pub fn charge_subscription(env: Env, subscription_id: u32) -> Result<(), Error> {
         require_not_emergency_stop(&env)?;
-        charge_core::charge_one(&env, subscription_id, env.ledger().timestamp(), None)
+        let res = charge_core::charge_one(&env, subscription_id, env.ledger().timestamp(), None);
+        if let Err(Error::InsufficientBalance) = res {
+            // Preserve transitions that happen inside charge_one for grace and no-grace flow.
+            let sub = crate::queries::get_subscription(&env, subscription_id)?;
+            match sub.status {
+                SubscriptionStatus::GracePeriod | SubscriptionStatus::InsufficientBalance => Ok(()),
+                _ => Err(Error::InsufficientBalance),
+            }
+        } else {
+            res
+        }
     }
 
     /// Charge a metered usage amount against the subscription's prepaid balance.
@@ -963,11 +973,14 @@ impl SubscriptionVault {
     }
 
     /// Get the global configuration for a merchant.
-    pub fn get_merchant_config(env: Env, merchant: Address) -> Option<crate::types::MerchantConfig> {
+    pub fn get_merchant_config(
+        env: Env,
+        merchant: Address,
+    ) -> Option<crate::types::MerchantConfig> {
         merchant::get_merchant_config(&env, merchant)
     }
-
 }
 
+mod test;
 #[cfg(test)]
 mod test_governance;

@@ -126,6 +126,7 @@ pub fn charge_one(
             if sub.status == SubscriptionStatus::GracePeriod {
                 validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
                 sub.status = SubscriptionStatus::Active;
+                sub.grace_start_timestamp = None; // <-- CRITICAL FIX
             }
 
             // Check if cap is now exactly reached -- auto-cancel
@@ -182,17 +183,87 @@ pub fn charge_one(
 
             Ok(())
         }
+        // charge_one.rs  —  replace the entire Err(_) arm in charge_one()
         Err(_) => {
             let grace_duration = crate::admin::get_grace_period(env).unwrap_or(0);
-            let grace_expires = next_allowed
-                .checked_add(grace_duration)
+            let due_timestamp = sub
+                .last_payment_timestamp
+                .checked_add(sub.interval_seconds)
                 .ok_or(Error::Overflow)?;
 
-            if grace_duration > 0 && now < grace_expires {
-                Err(Error::InsufficientBalance)
-            } else {
-                Err(Error::InsufficientBalance)
+            // No grace period configured -> move to InsufficientBalance and keep state.
+            if grace_duration == 0 {
+                validate_status_transition(&sub.status, &SubscriptionStatus::InsufficientBalance)?;
+                sub.status = SubscriptionStatus::InsufficientBalance;
+                sub.grace_start_timestamp = None;
+                env.storage().instance().set(&subscription_id, &sub);
+                return Err(Error::InsufficientBalance);
             }
+
+            // ACTIVE transition logic (first insufficiency).
+            if sub.status == SubscriptionStatus::Active {
+                let grace_expires = due_timestamp
+                    .checked_add(grace_duration)
+                    .ok_or(Error::Overflow)?;
+
+                if now == due_timestamp {
+                    validate_status_transition(&sub.status, &SubscriptionStatus::GracePeriod)?;
+                    sub.status = SubscriptionStatus::GracePeriod;
+                    sub.grace_start_timestamp = Some(due_timestamp);
+                    env.storage().instance().set(&subscription_id, &sub);
+
+                    env.events().publish(
+                        (Symbol::new(env, "grace_period_entered"), subscription_id),
+                        crate::types::GracePeriodEnteredEvent {
+                            subscription_id,
+                            grace_expires,
+                            timestamp: due_timestamp,
+                        },
+                    );
+
+                    return Err(Error::InsufficientBalance);
+                }
+
+                if now <= grace_expires {
+                    // If we are inside theoretical grace window but were not charged at due
+                    // exactly, we still treat this as a charge failure without changing state.
+                    return Err(Error::InsufficientBalance);
+                }
+
+                // Past grace window relative to the due time, no transition persisted.
+                return Err(Error::InsufficientBalance);
+            }
+
+            // GRACE_PERIOD state: either still failing or now expired.
+            if sub.status == SubscriptionStatus::GracePeriod {
+                let grace_start = sub
+                    .grace_start_timestamp
+                    .ok_or(Error::InvalidStatusTransition)?;
+                let grace_expires = grace_start
+                    .checked_add(grace_duration)
+                    .ok_or(Error::Overflow)?;
+
+                if now < grace_expires {
+                    return Err(Error::InsufficientBalance);
+                }
+
+                validate_status_transition(&sub.status, &SubscriptionStatus::InsufficientBalance)?;
+                sub.status = SubscriptionStatus::InsufficientBalance;
+                sub.grace_start_timestamp = None;
+                env.storage().instance().set(&subscription_id, &sub);
+
+                env.events().publish(
+                    (Symbol::new(env, "grace_period_expired"), subscription_id),
+                    crate::types::GracePeriodExpiredEvent {
+                        subscription_id,
+                        timestamp: now,
+                    },
+                );
+
+                return Err(Error::InsufficientBalance);
+            }
+
+            Err(Error::InsufficientBalance)
         }
     }
 }

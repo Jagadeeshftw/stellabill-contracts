@@ -12,9 +12,9 @@
 //!
 //! See `docs/reentrancy.md` for details on the reentrancy threat model and mitigation.
 
-use crate::types::MerchantConfig;
 use crate::safe_math::validate_non_negative;
 use crate::types::Error;
+use crate::types::MerchantConfig;
 use soroban_sdk::{token, Address, Env, Symbol};
 
 fn merchant_balance_key(
@@ -131,7 +131,7 @@ pub fn set_merchant_config(
     config: MerchantConfig,
 ) -> Result<(), Error> {
     merchant.require_auth();
-    
+
     // Validation: URL shouldn't be excessively long (standard limit 256)
     if config.redirect_url.len() > 256 {
         return Err(Error::InvalidAmount); // Reusing error or add specific one

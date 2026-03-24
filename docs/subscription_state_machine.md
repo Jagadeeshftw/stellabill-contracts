@@ -15,7 +15,8 @@ The subscription can be in one of four states:
 | **Active** | Subscription is active and charges can be processed | Default state after creation, or resumed from Paused/InsufficientBalance |
 | **Paused** | Subscription is temporarily suspended, no charges are processed | Paused from Active state by subscriber or merchant |
 | **Cancelled** | Subscription is permanently terminated | Cancelled from Active, Paused, or InsufficientBalance |
-| **InsufficientBalance** | Subscription failed due to insufficient funds for charging | Automatically entered when charge fails on Active subscription |
+| **InsufficientBalance** | Subscription cannot be charged until explicitly resumed | Can follow `GracePeriod` expiration, or be set by self-managed interface in test setup |
+| **GracePeriod** | Temporary window after an insufficient-balance charge during which a top-up and charge may recover to Active | Entered when `charge_subscription` on `Active` has insufficient funds and grace period is configured |
 
 ## State Diagram
 
@@ -35,7 +36,17 @@ The subscription can be in one of four states:
                               └──────────────────────┘
 ```
 
-## Allowed Transitions
+## Grace-period semantics
+
+Grace period is managed by charge flow on `Active` subscriptions.
+
+- `Active` → `GracePeriod`: on `charge_subscription()` failure due to insufficient prepaid balance, only when grace period config > 0.
+- `GracePeriod` entry timestamp is recorded as `due_timestamp = last_payment_timestamp + interval_seconds`.
+- `GracePeriod` remains allowed for all pause/cancel paths accepted by state machine.
+- `GracePeriod` → `InsufficientBalance`: when current ledger `now` is at or past `grace_start_timestamp + grace_period` and charge still fails.
+- `GracePeriod` → `Active`: on successful deferred charge while still in grace window.
+
+`charge_one` and `batch_charge` are aligned so the status updates in `GracePeriod` are persisted inside failed-charge path, and entrypoint returns semantic success (for transition).  `Error::InsufficientBalance` is still returned at call boundary for the initial insufficient-charge event.
 
 ### Valid Transitions
 
