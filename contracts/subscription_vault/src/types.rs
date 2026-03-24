@@ -690,3 +690,11 @@ pub struct PartialRefundEvent {
     /// Amount refunded in token base units.
     pub amount: i128,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MerchantConfig {
+    pub fee_address: Option<Address>,
+    pub redirect_url: String, // e.g., for off-chain success callbacks
+    pub is_paused: bool,      // Global pause for all merchant plans
+}

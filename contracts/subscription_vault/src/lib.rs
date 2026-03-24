@@ -943,7 +943,31 @@ impl SubscriptionVault {
     pub fn is_blocklisted(env: Env, subscriber: Address) -> bool {
         blocklist::is_blocklisted(&env, &subscriber)
     }
+
+    /// Set global configuration for a merchant.
+    ///
+    /// Authorization: merchant.
+    pub fn set_merchant_config(
+        env: Env,
+        merchant: Address,
+        fee_address: Option<Address>,
+        redirect_url: String,
+        is_paused: bool,
+    ) -> Result<(), Error> {
+        let config = crate::types::MerchantConfig {
+            fee_address,
+            redirect_url,
+            is_paused,
+        };
+        merchant::set_merchant_config(&env, merchant, config)
+    }
+
+    /// Get the global configuration for a merchant.
+    pub fn get_merchant_config(env: Env, merchant: Address) -> Option<crate::types::MerchantConfig> {
+        merchant::get_merchant_config(&env, merchant)
+    }
+
 }
 
 #[cfg(test)]
-mod test;
+mod test_governance;
