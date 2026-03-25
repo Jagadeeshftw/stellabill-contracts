@@ -947,3 +947,11 @@ impl SubscriptionVault {
 
 #[cfg(test)]
 mod test;
+
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    Subscription(u64),
+    AccountExposure(Address), // Tracks total committed $ per user
+    CreditLimit(Address),    // The ceiling for that exposure
+}
