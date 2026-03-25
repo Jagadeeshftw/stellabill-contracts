@@ -13,7 +13,7 @@
 //! See `docs/reentrancy.md` for details on the reentrancy threat model and mitigation.
 
 use crate::safe_math::{safe_sub_balance, validate_non_negative};
-use crate::types::{Error, MerchantWithdrawalEvent};
+use crate::types::{Error, MerchantConfig, MerchantWithdrawalEvent};
 use soroban_sdk::{token, Address, Env, Symbol};
 
 fn merchant_balance_key(
@@ -138,4 +138,30 @@ pub fn withdraw_merchant_funds_for_token(
     token_client.transfer(&contract, &merchant, &amount);
 
     Ok(())
+}
+
+fn merchant_config_key(env: &Env, merchant: &Address) -> (Symbol, Address) {
+    (Symbol::new(env, "merch_conf"), merchant.clone())
+}
+
+pub fn set_merchant_config(
+    env: &Env,
+    merchant: Address,
+    config: MerchantConfig,
+) -> Result<(), Error> {
+    merchant.require_auth();
+    
+    // Validation: URL shouldn't be excessively long (standard limit 256)
+    if config.redirect_url.len() > 256 {
+        return Err(Error::InvalidAmount); // Reusing error or add specific one
+    }
+
+    let key = merchant_config_key(env, &merchant);
+    env.storage().instance().set(&key, &config);
+    Ok(())
+}
+
+pub fn get_merchant_config(env: &Env, merchant: Address) -> Option<MerchantConfig> {
+    let key = merchant_config_key(env, &merchant);
+    env.storage().instance().get(&key)
 }
