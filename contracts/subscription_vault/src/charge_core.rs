@@ -1,8 +1,8 @@
 //! Single charge logic (no auth). Used by charge_subscription and batch_charge.
 //!
 //! Charge runs only when status is Active or GracePeriod. On insufficient balance the
-//! function returns an error without persisting failure-path state mutations, so
-//! batch and single-charge entrypoints observe the same ledger semantics.
+//! subscription is moved to a recoverable non-active state and an explicit failure
+//! event is emitted without mutating financial accounting state.
 //! On lifetime cap exhaustion the subscription is cancelled (terminal state).
 //!
 //! See `docs/subscription_lifecycle.md` for lifecycle details.
@@ -17,9 +17,10 @@ use crate::safe_math::{safe_add, safe_sub, safe_sub_balance};
 use crate::state_machine::validate_status_transition;
 use crate::statements::append_statement;
 use crate::types::{
-    BillingChargeKind, Error, LifetimeCapReachedEvent, SubscriptionChargedEvent, SubscriptionStatus,
+    BillingChargeKind, DataKey, Error, LifetimeCapReachedEvent, SubscriptionChargedEvent,
+    SubscriptionStatus, UsageLimits, UsageState, UsageStatementEvent,
 };
-use soroban_sdk::{symbol_short, Env, Symbol};
+use soroban_sdk::{symbol_short, Env, String, Symbol};
 
 const KEY_CHARGED_PERIOD: Symbol = symbol_short!("cp");
 const KEY_IDEM: Symbol = symbol_short!("idem");
@@ -32,14 +33,26 @@ fn idem_key(subscription_id: u32) -> (Symbol, u32) {
     (KEY_IDEM, subscription_id)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChargeExecutionResult {
+    Charged,
+    InsufficientBalance,
+}
+
 /// Performs a single interval-based charge with optional replay protection.
 pub fn charge_one(
     env: &Env,
     subscription_id: u32,
     now: u64,
     idempotency_key: Option<soroban_sdk::BytesN<32>>,
-) -> Result<(), Error> {
+) -> Result<ChargeExecutionResult, Error> {
     let mut sub = get_subscription(env, subscription_id)?;
+    let merchant = sub.merchant.clone();
+
+    if crate::merchant::get_merchant_paused(env, merchant.clone()) {
+        return Err(Error::MerchantPaused);
+    }
+
     let charge_amount = crate::oracle::resolve_charge_amount(env, &sub)?;
 
     if sub.status != SubscriptionStatus::Active && sub.status != SubscriptionStatus::GracePeriod {
@@ -56,7 +69,7 @@ pub fn charge_one(
             .get::<_, soroban_sdk::BytesN<32>>(&idem_key(subscription_id))
         {
             if stored == *k {
-                return Ok(());
+                return Ok(ChargeExecutionResult::Charged);
             }
         }
     }
@@ -100,7 +113,7 @@ pub fn charge_one(
                 },
             );
 
-            return Ok(());
+            return Ok(ChargeExecutionResult::Charged);
         }
     }
 
@@ -114,6 +127,7 @@ pub fn charge_one(
                 &sub.merchant,
                 &sub.token,
                 charge_amount,
+                BillingChargeKind::Interval,
             )?;
             sub.last_payment_timestamp = now;
 
@@ -123,6 +137,7 @@ pub fn charge_one(
             if sub.status == SubscriptionStatus::GracePeriod {
                 validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
                 sub.status = SubscriptionStatus::Active;
+                sub.grace_start_timestamp = None; // <-- CRITICAL FIX
             }
 
             // Check if cap is now exactly reached -- auto-cancel
@@ -177,26 +192,61 @@ pub fn charge_one(
                 }
             }
 
-            Ok(())
+            Ok(ChargeExecutionResult::Charged)
         }
+        // charge_one.rs  —  replace the entire Err(_) arm in charge_one()
         Err(_) => {
             let grace_duration = crate::admin::get_grace_period(env).unwrap_or(0);
-            let grace_expires = next_allowed
-                .checked_add(grace_duration)
+            let due_timestamp = sub
+                .last_payment_timestamp
+                .checked_add(sub.interval_seconds)
                 .ok_or(Error::Overflow)?;
 
-            if grace_duration > 0 && now < grace_expires {
-                Err(Error::InsufficientBalance)
+            let target_status = if grace_duration > 0 && now < grace_expires {
+                SubscriptionStatus::GracePeriod
             } else {
-                Err(Error::InsufficientBalance)
+                SubscriptionStatus::InsufficientBalance
+            };
+
+            if sub.status != target_status {
+                validate_status_transition(&sub.status, &target_status)?;
+                sub.status = target_status.clone();
             }
+
+            storage.set(&subscription_id, &sub);
+
+            let shortfall = charge_amount.saturating_sub(sub.prepaid_balance).max(0);
+            env.events().publish(
+                (Symbol::new(env, "charge_failed"), subscription_id),
+                SubscriptionChargeFailedEvent {
+                    subscription_id,
+                    merchant: sub.merchant,
+                    required_amount: charge_amount,
+                    available_balance: sub.prepaid_balance,
+                    shortfall,
+                    resulting_status: target_status,
+                    timestamp: now,
+                },
+            );
+
+            Ok(ChargeExecutionResult::InsufficientBalance)
         }
     }
 }
 
 /// Debit a metered `usage_amount` from a subscription's prepaid balance.
-pub fn charge_usage_one(env: &Env, subscription_id: u32, usage_amount: i128) -> Result<(), Error> {
+pub fn charge_usage_one(
+    env: &Env,
+    subscription_id: u32,
+    usage_amount: i128,
+    reference: String,
+) -> Result<(), Error> {
     let mut sub = get_subscription(env, subscription_id)?;
+    let merchant = sub.merchant.clone();
+
+    if crate::merchant::get_merchant_paused(env, merchant.clone()) {
+        return Err(Error::MerchantPaused);
+    }
 
     if sub.status != SubscriptionStatus::Active {
         return Err(Error::NotActive);
@@ -222,7 +272,6 @@ pub fn charge_usage_one(env: &Env, subscription_id: u32, usage_amount: i128) -> 
             sub.status = SubscriptionStatus::Cancelled;
             env.storage().instance().set(&subscription_id, &sub);
 
-            let now = env.ledger().timestamp();
             env.events().publish(
                 (Symbol::new(env, "lifetime_cap_reached"), subscription_id),
                 LifetimeCapReachedEvent {
@@ -235,10 +284,18 @@ pub fn charge_usage_one(env: &Env, subscription_id: u32, usage_amount: i128) -> 
 
             return Ok(());
         }
-        sub.lifetime_charged = new_charged;
     }
+    sub.lifetime_charged = new_charged;
 
     sub.prepaid_balance = safe_sub(sub.prepaid_balance, usage_amount)?;
+
+    crate::merchant::credit_merchant_balance_for_token(
+        env,
+        &sub.merchant,
+        &sub.token,
+        usage_amount,
+        BillingChargeKind::Usage,
+    )?;
 
     if sub.prepaid_balance == 0 {
         validate_status_transition(&sub.status, &SubscriptionStatus::InsufficientBalance)?;
@@ -255,7 +312,6 @@ pub fn charge_usage_one(env: &Env, subscription_id: u32, usage_amount: i128) -> 
         sub.status = SubscriptionStatus::Cancelled;
 
         if let Some(cap) = sub.lifetime_cap {
-            let now = env.ledger().timestamp();
             env.events().publish(
                 (Symbol::new(env, "lifetime_cap_reached"), subscription_id),
                 LifetimeCapReachedEvent {
@@ -268,15 +324,30 @@ pub fn charge_usage_one(env: &Env, subscription_id: u32, usage_amount: i128) -> 
         }
     }
 
-    env.storage().instance().set(&subscription_id, &sub);
+    storage.set(&subscription_id, &sub);
+    storage.set(&ref_key, &reference);
+
     append_statement(
         env,
         subscription_id,
         usage_amount,
         sub.merchant.clone(),
         BillingChargeKind::Usage,
-        env.ledger().timestamp(),
-        env.ledger().timestamp(),
+        now,
+        now,
     );
+
+    env.events().publish(
+        (Symbol::new(env, "usage_statement"), subscription_id),
+        UsageStatementEvent {
+            subscription_id,
+            merchant: sub.merchant.clone(),
+            usage_amount,
+            token: sub.token.clone(),
+            timestamp: now,
+            reference,
+        },
+    );
+
     Ok(())
 }
