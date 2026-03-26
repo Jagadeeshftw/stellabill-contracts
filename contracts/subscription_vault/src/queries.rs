@@ -116,12 +116,21 @@ pub fn get_cap_info(env: &Env, subscription_id: u32) -> Result<CapInfo, Error> {
     })
 }
 
+/// Returns the configured max-active-subscriptions limit for a plan template.
+///
+/// A return value of `0` means no limit is enforced for that plan.
+/// The plan must exist; returns `0` if no limit has been explicitly set.
+pub fn get_plan_max_active_subs(env: &Env, plan_template_id: u32) -> u32 {
+    let key = (Symbol::new(env, "plan_max_active"), plan_template_id);
+    env.storage().instance().get(&key).unwrap_or(0)
+}
+
 /// Result of a paginated query for subscriptions by subscriber.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SubscriptionsPage {
     pub subscription_ids: Vec<u32>,
-    pub has_next: bool,
+    pub next_start_id: Option<u32>,
 }
 
 /// Get all subscription IDs for a given subscriber with pagination support.
@@ -131,7 +140,7 @@ pub fn list_subscriptions_by_subscriber(
     start_from_id: u32,
     limit: u32,
 ) -> Result<SubscriptionsPage, Error> {
-    if limit == 0 {
+    if limit == 0 || limit > 100 {
         return Err(Error::InvalidInput);
     }
 
@@ -139,39 +148,23 @@ pub fn list_subscriptions_by_subscriber(
     let next_id: u32 = env.storage().instance().get(&next_id_key).unwrap_or(0);
 
     let mut subscription_ids = Vec::new(env);
-    let mut count = 0u32;
-    let mut last_found_id = start_from_id;
+    let mut next_start_id = None;
 
     for id in start_from_id..next_id {
         if let Some(sub) = env.storage().instance().get::<u32, Subscription>(&id) {
             if sub.subscriber == subscriber {
-                subscription_ids.push_back(id);
-                count += 1;
-                last_found_id = id;
-                if count >= limit {
+                if subscription_ids.len() < limit {
+                    subscription_ids.push_back(id);
+                } else {
+                    next_start_id = Some(id);
                     break;
                 }
             }
         }
     }
 
-    let has_next = if count >= limit {
-        let mut found_next = false;
-        for id in (last_found_id + 1)..next_id {
-            if let Some(sub) = env.storage().instance().get::<u32, Subscription>(&id) {
-                if sub.subscriber == subscriber {
-                    found_next = true;
-                    break;
-                }
-            }
-        }
-        found_next
-    } else {
-        false
-    };
-
     Ok(SubscriptionsPage {
         subscription_ids,
-        has_next,
+        next_start_id,
     })
 }
