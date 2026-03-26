@@ -25,6 +25,15 @@ mod state_machine;
 mod statements;
 mod subscription;
 mod types;
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+mod test_refactor_check;
+#[cfg(test)]
+mod test_utils;
+#[cfg(test)]
+mod test_governance;
+
 
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec};
 
@@ -37,14 +46,14 @@ pub use types::{
     BillingCompactedEvent, BillingCompactionSummary, BillingRetentionConfig, BillingStatement,
     BillingStatementAggregate, BillingStatementsPage, CapInfo, ContractSnapshot, DataKey,
     EmergencyStopDisabledEvent, EmergencyStopEnabledEvent, Error, FundsDepositedEvent,
-    LifetimeCapReachedEvent, MerchantWithdrawalEvent, MetadataDeletedEvent, MetadataSetEvent,
-    MigrationExportEvent, NextChargeInfo, OneOffChargedEvent, OracleConfig, OraclePrice,
-    PartialRefundEvent, PlanMaxActiveUpdatedEvent, PlanTemplate, PlanTemplateUpdatedEvent,
-    RecoveryEvent, RecoveryReason,
-    Subscription, SubscriptionCancelledEvent, SubscriptionChargedEvent, SubscriptionCreatedEvent,
+    LifetimeCapReachedEvent, MerchantPausedEvent, MerchantUnpausedEvent, MerchantWithdrawalEvent,
+    MetadataDeletedEvent, MetadataSetEvent, MigrationExportEvent, NextChargeInfo,
+    OneOffChargedEvent, OracleConfig, OraclePrice, PartialRefundEvent, PlanTemplate,
+    PlanTemplateUpdatedEvent, RecoveryEvent, RecoveryReason, Subscription,
+    SubscriptionCancelledEvent, SubscriptionChargedEvent, SubscriptionCreatedEvent,
     SubscriptionMigratedEvent, SubscriptionPausedEvent, SubscriptionResumedEvent,
-    SubscriptionStatus, SubscriptionSummary, MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH,
-    MAX_METADATA_VALUE_LENGTH,
+    SubscriptionStatus, SubscriptionSummary, UsageLimits, UsageState, UsageStatementEvent,
+    MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
 };
 /// Maximum subscription ID this contract will ever allocate.
 ///
@@ -607,7 +616,7 @@ impl SubscriptionVault {
         subscription::do_pause_subscription(&env, subscription_id, authorizer)
     }
 
-    /// Resume a subscription to Active. Allowed from Paused or InsufficientBalance.
+    /// Resume a subscription to Active. Allowed from Paused, GracePeriod, or InsufficientBalance.
     pub fn resume_subscription(
         env: Env,
         subscription_id: u32,
@@ -632,10 +641,13 @@ impl SubscriptionVault {
     ///
     /// **This function is disabled when the emergency stop is active.**
     ///
-    /// Enforces strict interval timing and replay protection.
+    /// Enforces strict interval timing and replay protection. Underfunded attempts
+    /// move the subscription into a recoverable non-active state and emit a
+    /// charge-failed event without mutating financial accounting fields.
     pub fn charge_subscription(env: Env, subscription_id: u32) -> Result<(), Error> {
         require_not_emergency_stop(&env)?;
-        charge_core::charge_one(&env, subscription_id, env.ledger().timestamp(), None)
+        charge_core::charge_one(&env, subscription_id, env.ledger().timestamp(), None)?;
+        Ok(())
     }
 
     /// Charge a metered usage amount against the subscription's prepaid balance.
@@ -643,7 +655,46 @@ impl SubscriptionVault {
     /// **This function is disabled when the emergency stop is active.**
     pub fn charge_usage(env: Env, subscription_id: u32, usage_amount: i128) -> Result<(), Error> {
         require_not_emergency_stop(&env)?;
-        charge_core::charge_usage_one(&env, subscription_id, usage_amount)
+        charge_core::charge_usage_one(
+            &env,
+            subscription_id,
+            usage_amount,
+            String::from_str(&env, "usage"),
+        )
+    }
+
+    /// Charge a metered usage amount against the subscription's prepaid balance with a reference.
+    ///
+    /// **This function is disabled when the emergency stop is active.**
+    pub fn charge_usage_with_reference(
+        env: Env,
+        subscription_id: u32,
+        usage_amount: i128,
+        reference: String,
+    ) -> Result<(), Error> {
+        require_not_emergency_stop(&env)?;
+        charge_core::charge_usage_one(&env, subscription_id, usage_amount, reference)
+    }
+
+    /// Configure usage rate limits and caps for a subscription. Merchant only.
+    pub fn configure_usage_limits(
+        env: Env,
+        merchant: Address,
+        subscription_id: u32,
+        rate_limit_max_calls: Option<u32>,
+        rate_window_secs: u64,
+        burst_min_interval_secs: u64,
+        usage_cap_units: Option<i128>,
+    ) -> Result<(), Error> {
+        subscription::do_configure_usage_limits(
+            &env,
+            merchant,
+            subscription_id,
+            rate_limit_max_calls,
+            rate_window_secs,
+            burst_min_interval_secs,
+            usage_cap_units,
+        )
     }
 
     // ── Merchant ──────────────────────────────────────────────────────────────
@@ -671,6 +722,21 @@ impl SubscriptionVault {
     /// Token-scoped merchant balance.
     pub fn get_merchant_balance_by_token(env: Env, merchant: Address, token: Address) -> i128 {
         merchant::get_merchant_balance_by_token(&env, &merchant, &token)
+    }
+
+    /// Check if a merchant has enabled a blanket pause.
+    pub fn get_merchant_paused(env: Env, merchant: Address) -> bool {
+        merchant::get_merchant_paused(&env, merchant)
+    }
+
+    /// Enable a blanket pause for all of the merchant's subscriptions.
+    pub fn pause_merchant(env: Env, merchant: Address) -> Result<(), Error> {
+        merchant::pause_merchant(&env, merchant)
+    }
+
+    /// Disable a blanket pause for the merchant's subscriptions.
+    pub fn unpause_merchant(env: Env, merchant: Address) -> Result<(), Error> {
+        merchant::unpause_merchant(&env, merchant)
     }
 
     // ── Queries ──────────────────────────────────────────────────────────────
@@ -972,13 +1038,17 @@ impl SubscriptionVault {
     }
 
     /// Get the global configuration for a merchant.
-    pub fn get_merchant_config(env: Env, merchant: Address) -> Option<crate::types::MerchantConfig> {
+    pub fn get_merchant_config(
+        env: Env,
+        merchant: Address,
+    ) -> Option<crate::types::MerchantConfig> {
         merchant::get_merchant_config(&env, merchant)
     }
-
 }
 
-#[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_governance;
+mod test;
+
+#[cfg(test)]
+mod test_usage_limits;
