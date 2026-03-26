@@ -23,7 +23,7 @@ use crate::state_machine::validate_status_transition;
 use crate::statements::append_statement;
 use crate::types::{
     BillingChargeKind, DataKey, Error, PartialRefundEvent, PlanTemplate, PlanTemplateUpdatedEvent,
-    Subscription, SubscriptionMigratedEvent, SubscriptionStatus,
+    Subscription, SubscriptionMigratedEvent, SubscriptionStatus, UsageLimits, UsageState,
 };
 use soroban_sdk::{symbol_short, Address, Env, Symbol, Vec};
 
@@ -257,6 +257,7 @@ pub fn do_create_subscription_with_token(
         usage_enabled,
         lifetime_cap,
         lifetime_charged: 0i128,
+        grace_start_timestamp: None,
     };
 
     // Allocate ID with overflow / limit guard.
@@ -324,6 +325,10 @@ pub fn do_deposit_funds(
     validate_non_negative(amount)?;
 
     let mut sub = get_subscription(env, subscription_id)?;
+    if subscriber != sub.subscriber {
+        return Err(Error::Forbidden);
+    }
+
     let token_addr = sub.token.clone();
 
     // Enforce credit limit for additional prepaid balance being loaded.
@@ -339,8 +344,30 @@ pub fn do_deposit_funds(
 
     env.events().publish(
         (Symbol::new(env, "deposited"), subscription_id),
-        (subscriber, amount, sub.prepaid_balance),
+        FundsDepositedEvent {
+            subscription_id,
+            subscriber,
+            amount,
+            prepaid_balance: sub.prepaid_balance,
+        },
     );
+
+    if (sub.status == SubscriptionStatus::InsufficientBalance
+        || sub.status == SubscriptionStatus::GracePeriod)
+        && sub.prepaid_balance >= sub.amount
+    {
+        env.events().publish(
+            (Symbol::new(env, "recovery_ready"), subscription_id),
+            SubscriptionRecoveryReadyEvent {
+                subscription_id,
+                subscriber: sub.subscriber,
+                prepaid_balance: sub.prepaid_balance,
+                required_amount: sub.amount,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
     Ok(())
 }
 
@@ -358,12 +385,35 @@ pub fn do_cancel_subscription(
     }
 
     validate_status_transition(&sub.status, &SubscriptionStatus::Cancelled)?;
+    let refund_amount = sub.prepaid_balance;
     sub.status = SubscriptionStatus::Cancelled;
 
     env.storage().instance().set(&subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "subscription_cancelled"), subscription_id),
+        SubscriptionCancelledEvent {
+            subscription_id,
+            authorizer,
+            refund_amount,
+        },
+    );
     Ok(())
 }
 
+/// Pause a subscription (no charges until resumed).
+///
+/// # Authorization
+/// Only the subscription's `subscriber` or `merchant` may pause.
+/// Any other caller receives [`Error::Forbidden`].
+///
+/// # Transition guard
+/// Only `Active → Paused` is permitted by the state machine.
+/// Calling on an already-`Paused` subscription is idempotent (same-state rule).
+/// Any other source state returns [`Error::InvalidStatusTransition`].
+///
+/// # Events
+/// Emits [`SubscriptionPausedEvent`] on every state-changing call.
 pub fn do_pause_subscription(
     env: &Env,
     subscription_id: u32,
@@ -372,13 +422,45 @@ pub fn do_pause_subscription(
     authorizer.require_auth();
 
     let mut sub = get_subscription(env, subscription_id)?;
-    validate_status_transition(&sub.status, &SubscriptionStatus::Paused)?;
-    sub.status = SubscriptionStatus::Paused;
 
+    // Actor check: only subscriber or merchant may pause.
+    if authorizer != sub.subscriber && authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+
+    validate_status_transition(&sub.status, &SubscriptionStatus::Paused)?;
+
+    // Idempotent: already paused — nothing to do, no event.
+    if sub.status == SubscriptionStatus::Paused {
+        return Ok(());
+    }
+
+    sub.status = SubscriptionStatus::Paused;
     env.storage().instance().set(&subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "sub_paused"), subscription_id),
+        crate::types::SubscriptionPausedEvent {
+            subscription_id,
+            authorizer,
+        },
+    );
+
     Ok(())
 }
 
+/// Resume a paused, grace-period, or insufficient-balance subscription back to `Active`.
+///
+/// # Authorization
+/// Only the subscription's `subscriber` or `merchant` may resume.
+/// Any other caller receives [`Error::Forbidden`].
+///
+/// # Transition guard
+/// `Paused → Active`, `GracePeriod → Active`, and `InsufficientBalance → Active` are permitted.
+/// Any other source state (including `Cancelled`) returns [`Error::InvalidStatusTransition`].
+///
+/// # Events
+/// Emits [`SubscriptionResumedEvent`] on every state-changing call.
 pub fn do_resume_subscription(
     env: &Env,
     subscription_id: u32,
@@ -387,10 +469,37 @@ pub fn do_resume_subscription(
     authorizer.require_auth();
 
     let mut sub = get_subscription(env, subscription_id)?;
-    validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
-    sub.status = SubscriptionStatus::Active;
 
+    // Actor check: only subscriber or merchant may resume.
+    if authorizer != sub.subscriber && authorizer != sub.merchant {
+        return Err(Error::Forbidden);
+    }
+
+    validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
+
+    // Idempotent: already active — nothing to do, no event.
+    if sub.status == SubscriptionStatus::Active {
+        return Ok(());
+    }
+
+    if (sub.status == SubscriptionStatus::InsufficientBalance
+        || sub.status == SubscriptionStatus::GracePeriod)
+        && sub.prepaid_balance < sub.amount
+    {
+        return Err(Error::InsufficientBalance);
+    }
+
+    sub.status = SubscriptionStatus::Active;
     env.storage().instance().set(&subscription_id, &sub);
+
+    env.events().publish(
+        (Symbol::new(env, "sub_resumed"), subscription_id),
+        crate::types::SubscriptionResumedEvent {
+            subscription_id,
+            authorizer,
+        },
+    );
+
     Ok(())
 }
 
@@ -436,6 +545,14 @@ pub fn do_charge_one_off(
         .checked_sub(amount)
         .ok_or(Error::Overflow)?;
 
+    crate::merchant::credit_merchant_balance_for_token(
+        env,
+        &sub.merchant,
+        &sub.token,
+        amount,
+        BillingChargeKind::OneOff,
+    )?;
+
     env.storage().instance().set(&subscription_id, &sub);
     append_statement(
         env,
@@ -467,23 +584,48 @@ pub fn do_withdraw_subscriber_funds(
     }
 
     let amount_to_refund = sub.prepaid_balance;
-    if amount_to_refund > 0 {
-        sub.prepaid_balance = 0;
-        env.storage().instance().set(&subscription_id, &sub);
-
-        let token_addr = sub.token.clone();
-        let token_client = soroban_sdk::token::Client::new(env, &token_addr);
-
-        token_client.transfer(
-            &env.current_contract_address(),
-            &subscriber,
-            &amount_to_refund,
-        );
+    if amount_to_refund <= 0 {
+        return Err(Error::InvalidAmount);
     }
+
+    sub.prepaid_balance = 0;
+    env.storage().instance().set(&subscription_id, &sub);
+
+    let token_addr = sub.token.clone();
+    let token_client = soroban_sdk::token::Client::new(env, &token_addr);
+
+    token_client.transfer(
+        &env.current_contract_address(),
+        &subscriber,
+        &amount_to_refund,
+    );
+
+    env.events().publish(
+        (Symbol::new(env, "subscriber_withdrawal"), subscription_id),
+        SubscriberWithdrawalEvent {
+            subscription_id,
+            subscriber,
+            amount: amount_to_refund,
+        },
+    );
 
     Ok(())
 }
 
+/// Process a partial refund against a subscription's remaining prepaid balance.
+///
+/// # Authorization
+/// Only the contract admin may authorize partial refunds. The `subscriber`
+/// parameter is validated against the subscription record but does **not**
+/// require the subscriber's own signature — the admin acts on their behalf.
+///
+/// # Preconditions
+/// - `amount > 0`
+/// - `amount <= subscription.prepaid_balance`
+/// - `subscriber` matches `subscription.subscriber`
+///
+/// # CEI pattern
+/// State is updated before the token transfer to prevent reentrancy.
 pub fn do_partial_refund(
     env: &Env,
     admin: Address,
@@ -491,9 +633,8 @@ pub fn do_partial_refund(
     subscriber: Address,
     amount: i128,
 ) -> Result<(), Error> {
+    // Checks: admin authorization and input validation first.
     super::require_admin_auth(env, &admin)?;
-
-    subscriber.require_auth();
 
     if amount <= 0 {
         return Err(Error::InvalidAmount);
@@ -502,23 +643,22 @@ pub fn do_partial_refund(
     let mut sub = get_subscription(env, subscription_id)?;
 
     if subscriber != sub.subscriber {
-        return Err(Error::Forbidden);
+        return Err(Error::Unauthorized);
     }
 
     if amount > sub.prepaid_balance {
         return Err(Error::InsufficientBalance);
     }
 
-    // Effects: update internal state before performing external token transfer.
+    // Effects: debit balance before external call.
     sub.prepaid_balance = sub
         .prepaid_balance
         .checked_sub(amount)
         .ok_or(Error::Overflow)?;
     env.storage().instance().set(&subscription_id, &sub);
 
-    // Interactions: transfer refund amount from contract to subscriber.
-    let token_addr = sub.token.clone();
-    let token_client = soroban_sdk::token::Client::new(env, &token_addr);
+    // Interactions: transfer refund from vault to subscriber.
+    let token_client = soroban_sdk::token::Client::new(env, &sub.token);
     token_client.transfer(&env.current_contract_address(), &subscriber, &amount);
 
     env.events().publish(
@@ -527,6 +667,7 @@ pub fn do_partial_refund(
             subscription_id,
             subscriber,
             amount,
+            timestamp: env.ledger().timestamp(),
         },
     );
 
@@ -636,6 +777,7 @@ pub fn do_create_subscription_from_plan(
         usage_enabled: plan.usage_enabled,
         lifetime_cap: plan.lifetime_cap,
         lifetime_charged: 0i128,
+        grace_start_timestamp: None,
     };
 
     env.storage().instance().set(&id, &sub);
@@ -694,6 +836,12 @@ pub fn do_update_plan_template(
 
     // Do not allow changing token through versioning – that would be a different plan family.
     let token = existing.token.clone();
+
+    // Enforce usage flag consistency: usage_enabled cannot be changed through versioning
+    // to prevent accidental billing model shifts for downstream subscribers.
+    if usage_enabled != existing.usage_enabled {
+        return Err(Error::InvalidInput);
+    }
 
     let new_plan_id = next_plan_id(env);
     let new_version = existing.version + 1;
@@ -767,6 +915,11 @@ pub fn do_migrate_subscription_to_plan(
 
     // For safety, do not allow token switches via migration.
     if new_plan.token != sub.token {
+        return Err(Error::InvalidInput);
+    }
+
+    // For safety, do not allow billing model switches via migration.
+    if new_plan.usage_enabled != sub.usage_enabled {
         return Err(Error::InvalidInput);
     }
 
@@ -857,4 +1010,43 @@ pub fn get_subscriber_exposure(
     token: Address,
 ) -> Result<i128, Error> {
     compute_subscriber_exposure(env, &subscriber, &token)
+}
+
+pub fn do_configure_usage_limits(
+    env: &Env,
+    merchant: Address,
+    subscription_id: u32,
+    rate_limit_max_calls: Option<u32>,
+    rate_window_secs: u64,
+    burst_min_interval_secs: u64,
+    usage_cap_units: Option<i128>,
+) -> Result<(), Error> {
+    merchant.require_auth();
+
+    let sub = get_subscription(env, subscription_id)?;
+    if sub.merchant != merchant {
+        return Err(Error::Forbidden);
+    }
+    if !sub.usage_enabled {
+        return Err(Error::UsageNotEnabled);
+    }
+
+    if let Some(cap) = usage_cap_units {
+        if cap <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+    }
+
+    let limits = UsageLimits {
+        rate_limit_max_calls,
+        rate_window_secs,
+        burst_min_interval_secs,
+        usage_cap_units,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::UsageLimits(subscription_id), &limits);
+
+    Ok(())
 }
