@@ -7,6 +7,7 @@
 use crate::charge_core::{charge_one, ChargeExecutionResult};
 use crate::types::{
     AcceptedToken, AdminRotatedEvent, BatchChargeResult, Error, RecoveryEvent, RecoveryReason,
+    SubscriptionStatus,
 };
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
@@ -206,7 +207,7 @@ pub fn do_batch_charge(
             },
             Err(e) => BatchChargeResult {
                 success: false,
-                error_code: e.clone().to_code(),
+                error_code: e.to_code(),
             },
         };
         results.push_back(res);

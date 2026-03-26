@@ -1,3 +1,4 @@
+
 use crate::{
     can_transition, compute_next_charge_info, get_allowed_transitions, validate_status_transition,
     AdminRotatedEvent, Error, MerchantWithdrawalEvent, OraclePrice, RecoveryReason, Subscription, SubscriptionStatus,
@@ -656,6 +657,7 @@ fn test_subscription_struct_status_field() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.lifetime_cap, None);
@@ -678,6 +680,7 @@ fn test_subscription_struct_with_lifetime_cap() {
         usage_enabled: false,
         lifetime_cap: Some(cap),
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     assert_eq!(sub.lifetime_cap, Some(cap));
     assert_eq!(sub.lifetime_charged, 0);
@@ -1186,7 +1189,10 @@ fn test_batch_charge_matches_single_charge_semantics_for_identical_inputs() {
     let single_snapshots = snapshot_subscriptions(&test_env_single.client, &ids_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
         assert_eq!(batch_sub.lifetime_charged, single_sub.lifetime_charged);
     }
@@ -1231,8 +1237,20 @@ fn test_batch_charge_mixed_results_preserve_single_path_order_and_error_codes() 
     test_env_batch.jump(INTERVAL + 1);
     test_env_single.jump(INTERVAL + 1);
 
-    let ids_batch = [valid_batch, low_batch, paused_batch, 999_999u32, valid_batch];
-    let ids_single = [valid_single, low_single, paused_single, 999_999u32, valid_single];
+    let ids_batch = [
+        valid_batch,
+        low_batch,
+        paused_batch,
+        999_999u32,
+        valid_batch,
+    ];
+    let ids_single = [
+        valid_single,
+        low_single,
+        paused_single,
+        999_999u32,
+        valid_single,
+    ];
 
     let batch_results = collect_batch_result_codes(&test_env_batch.env, &test_env_batch.client, &ids_batch);
     let single_results = collect_single_charge_result_codes(&test_env_single.client, &ids_single);
@@ -1375,7 +1393,10 @@ fn test_batch_charge_failed_items_match_single_path_without_cross_item_side_effe
     let single_snapshots = snapshot_subscriptions(&test_env_single.client, &ids_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
     }
 
@@ -1445,7 +1466,10 @@ fn test_batch_charge_high_volume_list_matches_single_path_semantics() {
     let single_snapshots = snapshot_subscriptions(&test_env_single.client, &ids_single);
     for (batch_sub, single_sub) in batch_snapshots.iter().zip(single_snapshots.iter()) {
         assert_eq!(batch_sub.prepaid_balance, single_sub.prepaid_balance);
-        assert_eq!(batch_sub.last_payment_timestamp, single_sub.last_payment_timestamp);
+        assert_eq!(
+            batch_sub.last_payment_timestamp,
+            single_sub.last_payment_timestamp
+        );
         assert_eq!(batch_sub.status, single_sub.status);
     }
 
@@ -1486,6 +1510,7 @@ fn test_compute_next_charge_info_active() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert_eq!(info.next_charge_timestamp, T0 + INTERVAL);
@@ -1507,6 +1532,7 @@ fn test_compute_next_charge_info_paused() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(!info.is_charge_expected);
@@ -1528,6 +1554,7 @@ fn test_compute_next_charge_info_cancelled() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(!info.is_charge_expected);
@@ -1548,6 +1575,7 @@ fn test_compute_next_charge_info_insufficient_balance() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(info.is_charge_expected);
@@ -1568,6 +1596,7 @@ fn test_compute_next_charge_info_overflow_protection() {
         usage_enabled: false,
         lifetime_cap: None,
         lifetime_charged: 0,
+        grace_start_timestamp: None,
     };
     let info = compute_next_charge_info(&sub);
     assert!(info.is_charge_expected);

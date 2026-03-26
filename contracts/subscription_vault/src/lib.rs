@@ -1038,6 +1038,7 @@ impl SubscriptionVault {
     }
 }
 
+mod test;
 #[cfg(test)]
 mod test;
 

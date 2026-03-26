@@ -140,6 +140,7 @@ pub fn charge_one(
             if sub.status == SubscriptionStatus::GracePeriod {
                 validate_status_transition(&sub.status, &SubscriptionStatus::Active)?;
                 sub.status = SubscriptionStatus::Active;
+                sub.grace_start_timestamp = None; // <-- CRITICAL FIX
             }
 
             // Check if cap is now exactly reached -- auto-cancel
@@ -196,10 +197,12 @@ pub fn charge_one(
 
             Ok(ChargeExecutionResult::Charged)
         }
+        // charge_one.rs  —  replace the entire Err(_) arm in charge_one()
         Err(_) => {
             let grace_duration = crate::admin::get_grace_period(env).unwrap_or(0);
-            let grace_expires = next_allowed
-                .checked_add(grace_duration)
+            let due_timestamp = sub
+                .last_payment_timestamp
+                .checked_add(sub.interval_seconds)
                 .ok_or(Error::Overflow)?;
 
             let target_status = if grace_duration > 0 && now < grace_expires {

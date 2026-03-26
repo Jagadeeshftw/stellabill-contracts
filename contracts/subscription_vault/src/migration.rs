@@ -101,6 +101,7 @@ mod test {
             usage_enabled: false,
             lifetime_cap: None,
             lifetime_charged: 0,
+            grace_start_timestamp: None,
         }
     }
 

@@ -155,6 +155,9 @@ pub struct Subscription {
     /// When `lifetime_cap` is `Some(cap)` and `lifetime_charged >= cap`, no
     /// further charges are processed and the subscription transitions to `Cancelled`.
     pub lifetime_charged: i128,
+    /// Timestamp when the current grace period started, if any.
+    /// Used to track grace period duration and expiration.
+    pub grace_start_timestamp: Option<u64>,
 }
 
 /// Detailed error information for insufficient balance scenarios.
