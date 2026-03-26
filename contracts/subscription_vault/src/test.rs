@@ -5195,3 +5195,313 @@ fn test_event_schema_consistency() {
     // 2. Assert Topic 2 matches the subscriber Address
     // 3. Assert Data payload length is exactly 4
 }
+
+// ── One-Off Charge Hardening Tests ──────────────────────────────────────────
+
+#[test]
+fn test_oneoff_unauthorized_merchant_rejected() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let imposter = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    // Imposter (different merchant) must be rejected
+    let res = client.try_charge_one_off(&id, &imposter, &5_000_000i128);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    // Verify balance unchanged
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 50_000_000);
+}
+
+#[test]
+fn test_oneoff_zero_amount_rejected() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    let res = client.try_charge_one_off(&id, &merchant, &0i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_oneoff_negative_amount_rejected() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    let res = client.try_charge_one_off(&id, &merchant, &-1i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_oneoff_exceeds_balance_rejected() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    // Attempt to charge more than balance
+    let res = client.try_charge_one_off(&id, &merchant, &50_000_001i128);
+    assert_eq!(res, Err(Ok(Error::InsufficientPrepaidBalance)));
+
+    // Balance unchanged
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 50_000_000);
+}
+
+#[test]
+fn test_oneoff_exact_balance_succeeds() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    // Charge exactly the full balance
+    client.charge_one_off(&id, &merchant, &50_000_000i128);
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 0);
+}
+
+#[test]
+fn test_oneoff_on_paused_subscription_succeeds() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+    client.pause_subscription(&id, &subscriber);
+
+    // One-off charges should work on paused subscriptions
+    client.charge_one_off(&id, &merchant, &5_000_000i128);
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 45_000_000);
+    assert_eq!(sub.status, SubscriptionStatus::Paused);
+}
+
+#[test]
+fn test_oneoff_on_cancelled_subscription_rejected() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+    client.cancel_subscription(&id, &subscriber);
+
+    let res = client.try_charge_one_off(&id, &merchant, &5_000_000i128);
+    assert_eq!(res, Err(Ok(Error::NotActive)));
+}
+
+#[test]
+fn test_oneoff_partial_balance_boundary() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &10_000_000i128);
+
+    // Charge leaving exactly 1 unit remaining
+    client.charge_one_off(&id, &merchant, &9_999_999i128);
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 1);
+
+    // Now charge that last unit
+    client.charge_one_off(&id, &merchant, &1i128);
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 0);
+
+    // Any further charge should fail
+    let res = client.try_charge_one_off(&id, &merchant, &1i128);
+    assert_eq!(res, Err(Ok(Error::InsufficientPrepaidBalance)));
+}
+
+#[test]
+fn test_oneoff_blocked_by_emergency_stop() {
+    let (env, client, token, admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    // Enable emergency stop
+    client.enable_emergency_stop(&admin);
+
+    let res = client.try_charge_one_off(&id, &merchant, &5_000_000i128);
+    assert_eq!(res, Err(Ok(Error::EmergencyStopActive)));
+
+    // Disable and verify charge works again
+    client.disable_emergency_stop(&admin);
+    client.charge_one_off(&id, &merchant, &5_000_000i128);
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.prepaid_balance, 45_000_000);
+}
+
+#[test]
+fn test_oneoff_statement_kind_consistency() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    client.charge_one_off(&id, &merchant, &7_000_000i128);
+
+    // Verify statement was recorded with OneOff kind
+    let page = client.get_sub_statements_offset(&id, &0, &10, &false);
+    assert_eq!(page.statements.len(), 1);
+
+    let stmt = page.statements.get(0).unwrap();
+    assert_eq!(stmt.amount, 7_000_000);
+    assert_eq!(stmt.kind, crate::types::BillingChargeKind::OneOff);
+    assert_eq!(stmt.merchant, merchant);
+    // For one-off, period_start == period_end
+    assert_eq!(stmt.period_start, stmt.period_end);
+}
+
+#[test]
+fn test_oneoff_event_emitted() {
+    use soroban_sdk::testutils::Events as _;
+
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    client.charge_one_off(&id, &merchant, &3_000_000i128);
+
+    // Verify oneoff_ch event was emitted (events().all() is non-empty after the call)
+    let all = env.events().all();
+    assert!(
+        !all.is_empty(),
+        "charge_one_off must emit at least one event"
+    );
+}
+
+#[test]
+fn test_oneoff_lifetime_cap_boundary() {
+    let (env, client, token, _admin) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    // Create subscription with lifetime cap of 20 USDC
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &Some(20_000_000i128),
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    // Charge up to cap boundary
+    client.charge_one_off(&id, &merchant, &20_000_000i128);
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.lifetime_charged, 20_000_000);
+
+    // Any further charge should hit lifetime cap
+    let res = client.try_charge_one_off(&id, &merchant, &1i128);
+    assert_eq!(res, Err(Ok(Error::LifetimeCapReached)));
+}
+
+#[test]
+fn test_oneoff_does_not_update_last_payment_timestamp() {
+    let (env, client, token, _admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&subscriber, &100_000_000i128);
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &AMOUNT, &INTERVAL, &false, &None::<i128>,
+    );
+    client.deposit_funds(&id, &subscriber, &50_000_000i128);
+
+    let sub_before = client.get_subscription(&id);
+    let ts_before = sub_before.last_payment_timestamp;
+
+    env.ledger().set_timestamp(T0 + 1000);
+    client.charge_one_off(&id, &merchant, &5_000_000i128);
+
+    let sub_after = client.get_subscription(&id);
+    assert_eq!(sub_after.last_payment_timestamp, ts_before);
+}

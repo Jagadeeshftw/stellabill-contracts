@@ -563,6 +563,16 @@ pub fn do_charge_one_off(
         env.ledger().timestamp(),
         env.ledger().timestamp(),
     );
+
+    env.events().publish(
+        (Symbol::new(env, "oneoff_ch"), subscription_id),
+        crate::types::OneOffChargedEvent {
+            subscription_id,
+            merchant: sub.merchant.clone(),
+            amount,
+        },
+    );
+
     Ok(())
 }
 

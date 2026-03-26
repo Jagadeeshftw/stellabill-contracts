@@ -626,12 +626,15 @@ impl SubscriptionVault {
     }
 
     /// Merchant-initiated one-off charge against the subscription's prepaid balance.
+    ///
+    /// **This function is disabled when the emergency stop is active.**
     pub fn charge_one_off(
         env: Env,
         subscription_id: u32,
         merchant: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        require_not_emergency_stop(&env)?;
         subscription::do_charge_one_off(&env, subscription_id, merchant, amount)
     }
 
