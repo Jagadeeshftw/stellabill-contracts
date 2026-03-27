@@ -252,13 +252,6 @@ pub fn credit_merchant_balance_for_token(
                 .checked_add(amount)
                 .ok_or(Error::Overflow)?
         }
-        BillingChargeKind::Charge => {
-            earnings.accruals.interval = earnings
-                .accruals
-                .interval
-                .checked_add(amount)
-                .ok_or(Error::Overflow)?
-        }
     }
     set_merchant_token_earnings(env, merchant, token_addr, &earnings);
     add_merchant_token(env, merchant, token_addr);
